@@ -38,16 +38,16 @@ prefix of a content hash so different crashes don't collide.
 | `fuzz_filename_stat_c84ffcca12.rar` | RAR5 metadata-iterate hang in the extra-field walker, 397 bytes. |
 | `fuzz_extract_mem_641db2ce06_lzss.rar` | RAR5 LZSS out-of-window back-reference (assert abort), 111 bytes. |
 | `fuzz_extract_mem_7fd55f96b7.rar` | Unbounded LZSS dictionary allocation (up to 4 GiB from one 64-bit header field), 335 bytes. |
+| `fuzz_extract_mem_73a7f1b48a_bspeek.rar` | Huffman decode on an uninitialized / zero-width table, 335 bytes. |
 
 First three surfaced on the initial 30-second smoke runs; the OOM was
-found on the first post-fix 60-second smoke run. All four now return
-cleanly and run under ASan in `test_fuzz_regressions`.
+found on the first post-fix 60-second smoke run, followed by the
+zero-width Huffman table crash on the next extract smoke run. All five
+now return cleanly and run under ASan in `test_fuzz_regressions`.
 
 ## Awaiting fix
 
-| Fixture | What it shows |
-|---------|---------------|
-| `fuzz_extract_mem_73a7f1b48a_bspeek.rar` | Assert `bit_count > 0` in `dmc_unrar_bs_peek_uint32` — Huffman decode on a zero-width table. 335 B; surfaced by the post-dict-cap smoke run. |
+None currently.
 
 New fuzz findings land as new fixtures here; until a fork/alarm
 isolation layer is added to `runner.c`, crash-/hang-class fixtures

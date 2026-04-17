@@ -3,21 +3,40 @@
 This document tracks the work needed to make `dmc_unrar` safer and more
 predictable for app use with arbitrary RAR archives.
 
-## Status (2026-04-16)
+## Status (2026-04-17)
 
-A first critical-fixes pass has landed. Completed:
+A first critical-fixes pass and a round of fuzz-driven hardening have
+landed. Completed:
 
 - Phase 1 baseline: golden corpus + differential harness + Makefile + CI
   (see `test/` and `.github/workflows/ci.yml`).
 - All Phase 2 items below (the six "Known Issues From Initial Review").
 - Phase 3 subset: memory-reader seek validation, allocation overflow in
   default wrappers, block-span overflow check before seeks, RAR4 header
-  CRC validation (gated by `DMC_UNRAR_DISABLE_HEADER_CRC_CHECK`).
+  CRC validation (gated by `DMC_UNRAR_DISABLE_HEADER_CRC_CHECK`), RAR5
+  file-header extra-field walker overflow/monotonicity checks plus a
+  `DMC_UNRAR_RAR5_NAME_MAX_LENGTH` cap, a boundary check on
+  `name_offset + name_size` that runs unconditionally (including when
+  `extra_size == 0`) so `dmc_unrar_get_filename()` can't return bytes
+  read from beyond the file header, and per-record bounds checks in
+  the extra-field walker so a zero-length or oversize record can't
+  cause the type varint to be read from outside the declared record
+  (and, at the tail of the extra area, outside the block header).
 - Phase 7 infrastructure: three libFuzzer harnesses
   (`open_mem` / `filename_stat` / `extract_mem`), seed corpus, crash
   minimization script, and a regression hook in `runner.c`. Fuzzing
   is out-of-band (local only, not in CI); fuzz-found bug fixtures
   live under `test/fixtures/fuzz/`.
+- Phase 7 findings (five bugs fixed so far): RAR5 header-parse hang,
+  RAR5 metadata-walker hang, LZSS out-of-window back-reference
+  assert, and unbounded LZSS dictionary allocation (up to 4 GiB
+  driven by a RAR5 header field), and a zero-width / uninitialized
+  Huffman decode path that drove an assert in
+  `dmc_unrar_bs_peek_uint32`. All five fixtures run under ASan in
+  `test_fuzz_regressions`.
+- Phase 6 starter: `DMC_UNRAR_MAX_DICT_SIZE` (default 256 MiB) caps
+  the LZSS window allocation per extraction. The full Phase 6 caps
+  (file count, total size, etc.) are still outstanding.
 - Phase 5 subset: `dmc_unrar_extract_file_to_path()` now rejects unsafe
   archive filenames (traversal, absolute, UNC, drive prefix) by default
   and returns `DMC_UNRAR_FILE_UNSAFE_PATH`. Path extraction is also
@@ -36,11 +55,13 @@ Still outstanding (tracked below):
   extraction after the first file.
 - Phase 5 tail: UTF-8 enforcement in the safety check, Windows-reserved-
   name rejection, opt-in overwrite protection.
-- Phase 6: resource limits.
-- Phase 7 tail: fix the three fuzz findings under `test/fixtures/fuzz/`
-  (two RAR5 hangs, one LZSS OOB read) and wire them into
-  `fuzz_regressions[]`. Add a fork/timeout isolation layer to
-  `runner.c` so hang-class fixtures can live in the regression table.
+- Phase 6: remaining resource limits (max file count, max total
+  uncompressed size, max compression ratio, PPMd memory cap).
+  `DMC_UNRAR_MAX_DICT_SIZE` is the first of these and is in place.
+- Phase 7 tail: add a fork/timeout isolation layer to `runner.c` so
+  hang/crash-class fixtures can land in the regression table pre-fix,
+  extend fuzzing beyond 60-second smoke runs once the Phase-6 caps
+  are all in.
 - Phase 8: documentation pass.
 
 CI currently runs on Ubuntu x86_64 and arm64 (`ubuntu-latest` +
@@ -226,7 +247,8 @@ Acceptance criteria:
 - [ ] Add a configurable maximum single-file uncompressed size.
 - [ ] Add a configurable maximum total uncompressed size.
 - [ ] Add a configurable maximum compression ratio.
-- [ ] Add a configurable maximum dictionary size.
+- [x] Add a configurable maximum dictionary size.
+      (`DMC_UNRAR_MAX_DICT_SIZE`, default 256 MiB.)
 - [ ] Add a configurable maximum PPMd memory size.
 - [ ] Add callback-driven cancellation or another app-controlled timeout
       mechanism.
@@ -309,4 +331,3 @@ Acceptance criteria:
 - Agent C: parser hardening and bounds checks.
 - Agent D: RAR5 solid extraction investigation and fixes.
 - Agent E: safe filesystem extraction wrapper and documentation.
-

@@ -4,4 +4,6 @@ dmc_unrar_bs_peek_bits with a zero-width Huffman table. The RAR5
 decoder builds tables from archive-supplied code lengths; a malformed
 archive can produce a table with table_size == 0, which then asks the
 bitstream to peek 0 bits. 335-byte input, surfaced on the 60-second
-post-fix smoke run of fuzz_extract_mem. Follow-up work.
+post-fix smoke run of fuzz_extract_mem. Fixed by rejecting
+uninitialized / zero-width Huffman decoders in
+dmc_unrar_huff_get_symbol().

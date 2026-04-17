@@ -9112,6 +9112,11 @@ static uint32_t dmc_unrar_huff_get_symbol(dmc_unrar_huff *huff, dmc_unrar_bs *bs
 
 	*err = DMC_UNRAR_OK;
 
+	if (!huff->tree || !huff->table || huff->table_size == 0) {
+		*err = DMC_UNRAR_HUFF_INVALID_CODE;
+		return 0xFFFFFFFF;
+	}
+
 	/* If we want to use the table, we need to make sure we have at least
 	 * as many bits left in the bitstream as the table is deep. Otherwise,
 	 * we're going to peek past the end of the bitstream. */
