@@ -1,0 +1,35 @@
+name: ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install rar / unrar
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y rar unrar
+
+      - name: Regenerate corpus
+        run: make -C test corpus
+
+      - name: C89 compile check
+        run: make -C test c89
+
+      - name: Plain build + tests
+        run: make -C test test
+
+      - name: ASan + UBSan
+        run: make -C test test-asan
+
+      - name: UBSan only
+        run: make -C test test-ubsan
+
+      - name: Differential vs system unrar
+        run: make -C test diff

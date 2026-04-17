@@ -247,6 +247,15 @@
 #define DMC_UNRAR_DISABLE_FILTERS 0
 #endif
 
+/* Set DMC_UNRAR_DISABLE_HEADER_CRC_CHECK to 1 to accept RAR4 block headers
+ * whose stored CRC does not match. Off by default (i.e. enforcement is on):
+ * a bad header CRC causes dmc_unrar_archive_open() to fail with
+ * DMC_UNRAR_INVALID_DATA. Historical archives written by broken tools may
+ * need this opt-out. */
+#ifndef DMC_UNRAR_DISABLE_HEADER_CRC_CHECK
+#define DMC_UNRAR_DISABLE_HEADER_CRC_CHECK 0
+#endif
+
 /* Do we have large file (>= 2GB) support? Can be defined to force enabling
  * or disabling of large file support, or kept undefined to let the
  * autodetection figure it out. The autodetection errs on being conservative,
@@ -509,6 +518,7 @@ typedef enum {
 	DMC_UNRAR_FILE_UNSUPPORTED_SPLIT,
 	DMC_UNRAR_FILE_UNSUPPORTED_LINK,
 	DMC_UNRAR_FILE_UNSUPPORTED_LARGE,
+	DMC_UNRAR_FILE_UNSAFE_PATH,
 
 	DMC_UNRAR_HUFF_RESERVED_SYMBOL,
 	DMC_UNRAR_HUFF_PREFIX_PRESENT,
@@ -978,6 +988,16 @@ dmc_unrar_return dmc_unrar_extract_file_to_file(dmc_unrar_archive *archive, dmc_
  *  (see DMC_UNRAR_DISABLE_WIN32 above). Without the WIN32 API, only plain ASCII paths
  *  are supported on Windows.
  *
+ *  Safety: this function validates the archive-internal filename for the
+ *  selected entry and refuses to extract when that name looks like it
+ *  could escape the caller's extraction root (traversal components such
+ *  as `..`, absolute paths starting with `/`, Windows drive prefixes like
+ *  `C:`, or UNC prefixes like `//server/share`). The error returned is
+ *  DMC_UNRAR_FILE_UNSAFE_PATH. This is a safety net for callers that
+ *  pass the archive's own filename through to this function unchanged.
+ *  Extraction writes to a sibling temp file that is atomically renamed
+ *  into place on success; on failure nothing is left at `path`.
+ *
  *  @param  archive The archive to extract from.
  *  @param  index The index of the file entry to extract.
  *  @param  path The file to open and write into. This must be UTF-8.
@@ -990,6 +1010,20 @@ dmc_unrar_return dmc_unrar_extract_file_to_file(dmc_unrar_archive *archive, dmc_
  */
 dmc_unrar_return dmc_unrar_extract_file_to_path(dmc_unrar_archive *archive, dmc_unrar_size_t index,
 	const char *path, dmc_unrar_size_t *uncompressed_size, bool validate_crc);
+
+/** Opt-out variant of dmc_unrar_extract_file_to_path() that does NOT
+ *  validate the archive-internal filename against filesystem-escape
+ *  patterns.
+ *
+ *  Use this only when you have already validated the archive filename
+ *  yourself, or when the target path is computed independently from
+ *  archive contents. For the usual case of feeding
+ *  dmc_unrar_get_filename() straight into the target path, prefer the
+ *  safe default dmc_unrar_extract_file_to_path().
+ */
+dmc_unrar_return dmc_unrar_extract_file_to_path_unsafe(dmc_unrar_archive *archive,
+	dmc_unrar_size_t index, const char *path,
+	dmc_unrar_size_t *uncompressed_size, bool validate_crc);
 #endif /* DMC_UNRAR_DISABLE_STDIO */
 
 /** Return true if the given \0-terminated string contains valid UTF-8 data. */
@@ -1185,6 +1219,9 @@ const char *dmc_unrar_strerror(dmc_unrar_return code) {
 
 		case DMC_UNRAR_FILE_UNSUPPORTED_LARGE:
 			return "Unsupported large file";
+
+		case DMC_UNRAR_FILE_UNSAFE_PATH:
+			return "Archive entry has an unsafe filename (traversal, absolute, or drive/UNC prefix)";
 
 		case DMC_UNRAR_HUFF_RESERVED_SYMBOL:
 			return "Reserved Huffman symbol";
@@ -1431,14 +1468,27 @@ struct dmc_unrar_internal_state_tag {
 };
 
 /* .--- Default allocation functions using malloc/realloc/free */
-static void *dmc_unrar_def_alloc_func(void *opaque, dmc_unrar_size_t items, dmc_unrar_size_t size) {
-	(void)opaque; (void)items; (void)size;
 
+/* Returns true if items*size fits in dmc_unrar_size_t without wrapping. */
+static bool dmc_unrar_size_mul_ok(dmc_unrar_size_t items, dmc_unrar_size_t size) {
+	if (items == 0 || size == 0)
+		return true;
+	return size <= DMC_UNRAR_SIZE_MAX / items;
+}
+
+static void *dmc_unrar_def_alloc_func(void *opaque, dmc_unrar_size_t items, dmc_unrar_size_t size) {
+	(void)opaque;
+
+	if (!dmc_unrar_size_mul_ok(items, size))
+		return NULL;
 	return DMC_UNRAR_MALLOC(items * size);
 }
 
 static void *dmc_unrar_def_realloc_func(void *opaque, void *address, dmc_unrar_size_t items, dmc_unrar_size_t size) {
-	(void)opaque; (void)address; (void)items; (void)size;
+	(void)opaque;
+
+	if (!dmc_unrar_size_mul_ok(items, size))
+		return NULL;
 	return DMC_UNRAR_REALLOC(address, items * size);
 }
 
@@ -1548,23 +1598,47 @@ static dmc_unrar_size_t dmc_unrar_io_mem_read_func(void *opaque, void *buffer, d
 }
 
 static bool dmc_unrar_io_mem_seek_func(void *opaque, dmc_unrar_offset_t offset, int origin) {
+	dmc_unrar_mem_reader *mem;
+	dmc_unrar_offset_t offset_max, cur, end, new_offset;
+
 	if (!opaque || origin < DMC_UNRAR_SEEK_SET || origin > DMC_UNRAR_SEEK_END)
 		return false;
 
-	{
-		dmc_unrar_mem_reader *mem = (dmc_unrar_mem_reader *)opaque;
+	mem = (dmc_unrar_mem_reader *)opaque;
 
-		if (origin == DMC_UNRAR_SEEK_CUR) {
-			/* TODO: Validate offset */
-			offset += mem->offset;
-		} else if (origin == DMC_UNRAR_SEEK_END) {
-			/* TODO: Validate offset */
-			offset += mem->size;
-		}
+	/* Max positive value of dmc_unrar_offset_t. Max-unsigned >> 1 strips
+	   the sign bit, giving the max representable positive offset. */
+	offset_max = (dmc_unrar_offset_t)(((dmc_unrar_size_t)-1) >> 1);
 
-		mem->offset = offset;
+	/* Pathological state: size or current position too large to express as
+	   a signed offset. Should not happen for real archives -- the library
+	   constructs mem_reader with size = dmc_unrar_size_t, which matches
+	   offset_t width on every supported platform. */
+	if (mem->size > (uint64_t)offset_max || mem->offset > (uint64_t)offset_max)
+		return false;
+
+	cur = (dmc_unrar_offset_t)mem->offset;
+	end = (dmc_unrar_offset_t)mem->size;
+
+	if (origin == DMC_UNRAR_SEEK_SET) {
+		new_offset = offset;
+	} else if (origin == DMC_UNRAR_SEEK_CUR) {
+		new_offset = cur + offset;
+		/* Signed add overflow/underflow. */
+		if (offset > 0 && new_offset < cur) return false;
+		if (offset < 0 && new_offset > cur) return false;
+	} else { /* DMC_UNRAR_SEEK_END */
+		new_offset = end + offset;
+		if (offset > 0 && new_offset < end) return false;
+		if (offset < 0 && new_offset > end) return false;
 	}
 
+	/* Reject negative and past-end seeks. The reader backs a fixed buffer,
+	   so past-end has no meaning and is treated as a seek failure. */
+	if (new_offset < 0 || (uint64_t)new_offset > mem->size)
+		return false;
+
+	mem->offset = (uint64_t)new_offset;
 	return true;
 }
 
@@ -2528,6 +2602,31 @@ static bool dmc_unrar_grow_files(dmc_unrar_archive *archive) {
 /* '--- */
 
 /* .--- Reading RAR blocks and file headers */
+
+/* Compute `block->start_pos + block->header_size + block->data_size` with
+   overflow and end-of-stream checks. Returns false on overflow or when the
+   end of the block would lie past the end of the archive stream. Used
+   before seeking past a block to parse the next one: a malformed archive
+   can otherwise cause the sum to wrap and seek to a fake valid position. */
+static bool dmc_unrar_block_end_pos(const dmc_unrar_block_header *block,
+		dmc_unrar_size_t stream_size, uint64_t *end_pos) {
+	uint64_t a, b;
+
+	a = block->start_pos + block->header_size;
+	if (a < block->start_pos)
+		return false;
+
+	b = a + block->data_size;
+	if (b < a)
+		return false;
+
+	if (b > (uint64_t)stream_size)
+		return false;
+
+	*end_pos = b;
+	return true;
+}
+
 static dmc_unrar_return dmc_unrar_rar4_read_block_header(dmc_unrar_archive *archive,
 	dmc_unrar_block_header *block);
 static dmc_unrar_return dmc_unrar_rar4_read_archive_header(dmc_unrar_archive *archive,
@@ -2618,8 +2717,14 @@ static dmc_unrar_return dmc_unrar_rar4_collect_blocks(dmc_unrar_archive *archive
 			}
 
 			/* Seek past this block, so we can read the next one. */
-			if (!dmc_unrar_io_seek(&archive->io, block->start_pos + block->header_size + block->data_size, DMC_UNRAR_SEEK_SET))
-				return DMC_UNRAR_SEEK_FAIL;
+			{
+				uint64_t end_pos;
+				if (!dmc_unrar_block_end_pos(block, archive->io.size, &end_pos))
+					return DMC_UNRAR_INVALID_DATA;
+				if (!dmc_unrar_io_seek(&archive->io, (dmc_unrar_offset_t)end_pos,
+				                       DMC_UNRAR_SEEK_SET))
+					return DMC_UNRAR_SEEK_FAIL;
+			}
 		}
 	}
 
@@ -2627,6 +2732,62 @@ static dmc_unrar_return dmc_unrar_rar4_collect_blocks(dmc_unrar_archive *archive
 
 	return DMC_UNRAR_OK;
 }
+
+#if DMC_UNRAR_DISABLE_HEADER_CRC_CHECK != 1
+/* Validate a RAR4 block-header CRC. The header runs [start_pos,
+   start_pos + header_size) with the 2-byte CRC field at start_pos; the
+   stored value is the low 16 bits of a CRC-32 over
+   [start_pos + 2, start_pos + header_size). Seeks back to the caller's
+   position on return so the parse resumes where it left off. */
+static dmc_unrar_return dmc_unrar_rar4_validate_header_crc(dmc_unrar_archive *archive,
+		const dmc_unrar_block_header *block) {
+	uint8_t stack_buf[256];
+	uint8_t *buf = stack_buf;
+	uint64_t span;
+	dmc_unrar_offset_t saved_pos;
+	dmc_unrar_return rc = DMC_UNRAR_OK;
+	uint32_t crc32;
+
+	if (block->header_size < 2)
+		return DMC_UNRAR_INVALID_DATA;
+
+	span = block->header_size - 2;
+	saved_pos = dmc_unrar_io_tell(&archive->io);
+
+	if (span > sizeof(stack_buf)) {
+		buf = (uint8_t *)dmc_unrar_malloc(&archive->alloc, (dmc_unrar_size_t)span, 1);
+		if (!buf)
+			return DMC_UNRAR_ALLOC_FAIL;
+	}
+
+	if (!dmc_unrar_io_seek(&archive->io, (dmc_unrar_offset_t)(block->start_pos + 2),
+	                       DMC_UNRAR_SEEK_SET)) {
+		rc = DMC_UNRAR_SEEK_FAIL;
+		goto done;
+	}
+
+	if (!dmc_unrar_io_read_checked(&archive->io, buf, (dmc_unrar_size_t)span)) {
+		rc = DMC_UNRAR_READ_FAIL;
+		goto done;
+	}
+
+	crc32 = dmc_unrar_crc32_calculate_from_mem(buf, (dmc_unrar_size_t)span);
+	if ((crc32 & 0xFFFF) != (block->crc & 0xFFFF))
+		rc = DMC_UNRAR_INVALID_DATA;
+
+done:
+	if (buf != stack_buf)
+		dmc_unrar_free(&archive->alloc, buf);
+	/* Restore position for the caller's subsequent reads. */
+	if (rc == DMC_UNRAR_OK) {
+		if (!dmc_unrar_io_seek(&archive->io, saved_pos, DMC_UNRAR_SEEK_SET))
+			rc = DMC_UNRAR_SEEK_FAIL;
+	} else {
+		(void)dmc_unrar_io_seek(&archive->io, saved_pos, DMC_UNRAR_SEEK_SET);
+	}
+	return rc;
+}
+#endif /* DMC_UNRAR_DISABLE_HEADER_CRC_CHECK */
 
 /** Read a RAR4 block header. */
 static dmc_unrar_return dmc_unrar_rar4_read_block_header(dmc_unrar_archive *archive,
@@ -2639,7 +2800,6 @@ static dmc_unrar_return dmc_unrar_rar4_read_block_header(dmc_unrar_archive *arch
 
 	block->start_pos = dmc_unrar_io_tell(&archive->io);
 
-	/* TODO: Validate the checksum. */
 	if (!dmc_unrar_io_read_uint16le(&archive->io, &crc))
 		return DMC_UNRAR_READ_FAIL;
 	if (!dmc_unrar_io_read_uint8(&archive->io, &type))
@@ -2658,6 +2818,14 @@ static dmc_unrar_return dmc_unrar_rar4_read_block_header(dmc_unrar_archive *arch
 	/* We just read 7 bytes, so.... */
 	if (block->header_size < 7)
 		return DMC_UNRAR_INVALID_DATA;
+
+#if DMC_UNRAR_DISABLE_HEADER_CRC_CHECK != 1
+	{
+		dmc_unrar_return crc_rc = dmc_unrar_rar4_validate_header_crc(archive, block);
+		if (crc_rc != DMC_UNRAR_OK)
+			return crc_rc;
+	}
+#endif
 
 	/* Does the block have data attached, after the header?. */
 	{
@@ -2978,6 +3146,12 @@ static dmc_unrar_return dmc_unrar_rar5_collect_blocks(dmc_unrar_archive *archive
 			if (block->type == DMC_UNRAR_BLOCK5_TYPE_END)
 				break;
 
+			/* The archive has encrypted headers. Every block after this
+			   one (including file headers) is ciphertext, which we have
+			   no way to read without the password. */
+			if (block->type == DMC_UNRAR_BLOCK5_TYPE_ENCRYPTION)
+				return DMC_UNRAR_ARCHIVE_UNSUPPORTED_ENCRYPTED;
+
 			/* It's a file. */
 			if (block->type == DMC_UNRAR_BLOCK5_TYPE_FILE) {
 				if (!dmc_unrar_grow_files(archive))
@@ -3001,8 +3175,14 @@ static dmc_unrar_return dmc_unrar_rar5_collect_blocks(dmc_unrar_archive *archive
 			}
 
 			/* Seek past this block, so we can read the next one. */
-			if (!dmc_unrar_io_seek(&archive->io, block->start_pos + block->header_size + block->data_size, DMC_UNRAR_SEEK_SET))
-				return DMC_UNRAR_SEEK_FAIL;
+			{
+				uint64_t end_pos;
+				if (!dmc_unrar_block_end_pos(block, archive->io.size, &end_pos))
+					return DMC_UNRAR_INVALID_DATA;
+				if (!dmc_unrar_io_seek(&archive->io, (dmc_unrar_offset_t)end_pos,
+				                       DMC_UNRAR_SEEK_SET))
+					return DMC_UNRAR_SEEK_FAIL;
+			}
 		}
 	}
 
@@ -4135,8 +4315,12 @@ dmc_unrar_return dmc_unrar_extract_file_with_callback(dmc_unrar_archive *archive
 
 	dmc_unrar_size_t output_size = 0;
 
-	if (!archive || !buffer)
+	if (!archive)
 		return DMC_UNRAR_ARCHIVE_EMPTY;
+
+	/* buffer == NULL is supported: the extractor allocates an internal
+	   buffer of buffer_size and frees it on return. buffer_size must
+	   still be > 0 for any data to actually flow. */
 
 	if (uncompressed_size)
 		*uncompressed_size = 0;
@@ -4186,6 +4370,9 @@ dmc_unrar_return dmc_unrar_extract_file_to_heap(dmc_unrar_archive *archive, dmc_
 	if (!buffer || !uncompressed_size)
 		return DMC_UNRAR_ARCHIVE_EMPTY;
 
+	*buffer = NULL;
+	*uncompressed_size = 0;
+
 	{
 		dmc_unrar_return is_supported = dmc_unrar_file_is_supported(archive, index);
 		if (is_supported != DMC_UNRAR_OK)
@@ -4206,7 +4393,8 @@ dmc_unrar_return dmc_unrar_extract_file_to_heap(dmc_unrar_archive *archive, dmc_
 				                              validate_crc);
 
 			if (extracted != DMC_UNRAR_OK) {
-				dmc_unrar_free(&archive->alloc, buffer);
+				dmc_unrar_free(&archive->alloc, heap_buffer);
+				*uncompressed_size = 0;
 				return extracted;
 			}
 		}
@@ -4336,27 +4524,248 @@ end:
 	return file;
 }
 
+/* UTF-8 path -> UTF-16 wchar buffer. Caller frees with DMC_UNRAR_FREE
+   (no-op when DMC_UNRAR_DISABLE_MALLOC is set and a static buffer was
+   used -- we only use this helper from functions that rely on malloc).
+   Returns NULL on conversion failure. */
+#if DMC_UNRAR_DISABLE_MALLOC != 1
+static wchar_t *dmc_unrar_win32_utf8_to_wide(const char *path) {
+	int buf_size = MultiByteToWideChar(CP_UTF8, 0, path, -1, NULL, 0);
+	wchar_t *buf;
+
+	if (buf_size == 0)
+		return NULL;
+
+	buf = (wchar_t *)DMC_UNRAR_MALLOC(buf_size * sizeof(wchar_t));
+	if (!buf)
+		return NULL;
+
+	if (MultiByteToWideChar(CP_UTF8, 0, path, -1, buf, buf_size) == 0) {
+		DMC_UNRAR_FREE(buf);
+		return NULL;
+	}
+	return buf;
+}
+
+static bool dmc_unrar_win32_rename(const char *src, const char *dst) {
+	wchar_t *wsrc = dmc_unrar_win32_utf8_to_wide(src);
+	wchar_t *wdst = dmc_unrar_win32_utf8_to_wide(dst);
+	bool ok = false;
+	if (wsrc && wdst) {
+		/* Replace an existing target, matching POSIX rename() semantics. */
+		ok = MoveFileExW(wsrc, wdst, MOVEFILE_REPLACE_EXISTING) != 0;
+	}
+	DMC_UNRAR_FREE(wsrc);
+	DMC_UNRAR_FREE(wdst);
+	return ok;
+}
+
+static void dmc_unrar_win32_unlink(const char *path) {
+	wchar_t *w = dmc_unrar_win32_utf8_to_wide(path);
+	if (w)
+		DeleteFileW(w);
+	DMC_UNRAR_FREE(w);
+}
+#endif /* DMC_UNRAR_DISABLE_MALLOC */
+
 #endif /* DMC_UNRAR_DISABLE_WIN32 */
 
-dmc_unrar_return dmc_unrar_extract_file_to_path(dmc_unrar_archive *archive, dmc_unrar_size_t index,
-	const char *path, dmc_unrar_size_t *uncompressed_size, bool validate_crc) {
+static FILE *dmc_unrar_fopen_write(const char *path) {
+#if DMC_UNRAR_DISABLE_WIN32 == 1
+	return fopen(path, "wb");
+#else
+	return dmc_unrar_win32_fopen_write(path);
+#endif
+}
+
+static bool dmc_unrar_rename(const char *src, const char *dst) {
+#if DMC_UNRAR_DISABLE_WIN32 == 1
+	return rename(src, dst) == 0;
+#else
+	#if DMC_UNRAR_DISABLE_MALLOC == 1
+		/* Without malloc we can't build UTF-16 path buffers from arbitrary
+		   lengths, so fall back to MoveFileExA — ASCII paths only. */
+		return MoveFileExA(src, dst, MOVEFILE_REPLACE_EXISTING) != 0;
+	#else
+		return dmc_unrar_win32_rename(src, dst);
+	#endif
+#endif
+}
+
+static void dmc_unrar_unlink(const char *path) {
+#if DMC_UNRAR_DISABLE_WIN32 == 1
+	(void)remove(path);
+#else
+	#if DMC_UNRAR_DISABLE_MALLOC == 1
+		DeleteFileA(path);
+	#else
+		dmc_unrar_win32_unlink(path);
+	#endif
+#endif
+}
+
+/* Suffix appended to the final path while extraction is in progress. */
+#define DMC_UNRAR_EXTRACT_TEMP_SUFFIX ".dmcunrar.tmp"
+
+/* Rejects archive filenames that could escape the caller's extraction
+   root. Names are assumed normalized to forward-slash separators (which
+   is what dmc_unrar_get_filename() returns). */
+static bool dmc_unrar_filename_is_safe(const char *name) {
+	const char *p, *comp_start;
+
+	if (!name || !*name)
+		return false;
+
+	/* Absolute path. */
+	if (name[0] == '/')
+		return false;
+
+	/* UNC-style prefix (forward or backslash form, just in case). */
+	if ((name[0] == '/' && name[1] == '/') ||
+	    (name[0] == '\\' && name[1] == '\\'))
+		return false;
+
+	/* Any backslash is suspicious: dmc_unrar_get_filename() normalizes
+	   separators to '/', so a surviving '\\' is either a UNC/drive
+	   construct or embedded in a component where it is equally unsafe
+	   to round-trip through a filesystem API. */
+	for (p = name; *p; p++)
+		if (*p == '\\')
+			return false;
+
+	/* Walk path components, rejecting ".." and a ":" inside the first
+	   component (blocks "C:" / "C:/foo" style drive prefixes). */
+	comp_start = name;
+	{
+		bool first_component = true;
+		for (p = name; ; p++) {
+			if (*p == '/' || *p == '\0') {
+				dmc_unrar_size_t len = (dmc_unrar_size_t)(p - comp_start);
+				if (len == 2 && comp_start[0] == '.' && comp_start[1] == '.')
+					return false;
+				if (first_component) {
+					dmc_unrar_size_t i;
+					for (i = 0; i < len; i++) {
+						if (comp_start[i] == ':')
+							return false;
+					}
+					first_component = false;
+				}
+				if (*p == '\0')
+					break;
+				comp_start = p + 1;
+			}
+		}
+	}
+
+	return true;
+}
+
+/* Validate the archive-internal filename for `index` against
+   filename_is_safe(). Allocates a temp buffer big enough for the name.
+   Returns OK if safe, DMC_UNRAR_FILE_UNSAFE_PATH if unsafe, or a
+   propagated error from get_filename (FILE_IS_INVALID / ALLOC_FAIL). */
+static dmc_unrar_return dmc_unrar_check_entry_path_is_safe(dmc_unrar_archive *archive,
+		dmc_unrar_size_t index) {
+	char stack_buf[512];
+	char *name = stack_buf;
+	dmc_unrar_size_t name_size;
+	dmc_unrar_return rc = DMC_UNRAR_OK;
+
+	name_size = dmc_unrar_get_filename(archive, index, NULL, 0);
+	if (name_size == 0)
+		return DMC_UNRAR_FILE_IS_INVALID;
+
+	if (name_size > sizeof(stack_buf)) {
+		name = (char *)dmc_unrar_malloc(&archive->alloc, name_size, 1);
+		if (!name)
+			return DMC_UNRAR_ALLOC_FAIL;
+	}
+
+	if (dmc_unrar_get_filename(archive, index, name, name_size) == 0) {
+		rc = DMC_UNRAR_FILE_IS_INVALID;
+	} else if (!dmc_unrar_filename_is_safe(name)) {
+		rc = DMC_UNRAR_FILE_UNSAFE_PATH;
+	}
+
+	if (name != stack_buf)
+		dmc_unrar_free(&archive->alloc, name);
+	return rc;
+}
+
+static dmc_unrar_return dmc_unrar_extract_file_to_path_impl(dmc_unrar_archive *archive,
+		dmc_unrar_size_t index, const char *path,
+		dmc_unrar_size_t *uncompressed_size, bool validate_crc, bool check_safety) {
+
+	/* Extract to a sibling temp file and atomically rename on success so
+	   a failed or interrupted extraction never leaves a half-written file
+	   that looks successful. */
 
 	dmc_unrar_return return_code;
 	FILE *file;
+	dmc_unrar_size_t path_len;
+	char *temp_path;
 
-#if DMC_UNRAR_DISABLE_WIN32 == 1
-	file = fopen(path, "wb");
-#else
-	file = dmc_unrar_win32_fopen_write(path);
-#endif
-
-	if (!file)
+	if (!archive)
+		return DMC_UNRAR_ARCHIVE_IS_NULL;
+	if (!path || !*path)
 		return DMC_UNRAR_OPEN_FAIL;
 
-	return_code = dmc_unrar_extract_file_to_file(archive, index, file, uncompressed_size, validate_crc);
+	if (uncompressed_size)
+		*uncompressed_size = 0;
 
+	if (check_safety) {
+		dmc_unrar_return safety = dmc_unrar_check_entry_path_is_safe(archive, index);
+		if (safety != DMC_UNRAR_OK)
+			return safety;
+	}
+
+	path_len = (dmc_unrar_size_t)strlen(path);
+	temp_path = (char *)dmc_unrar_malloc(&archive->alloc,
+		path_len + sizeof(DMC_UNRAR_EXTRACT_TEMP_SUFFIX), 1);
+	if (!temp_path)
+		return DMC_UNRAR_ALLOC_FAIL;
+	memcpy(temp_path, path, path_len);
+	memcpy(temp_path + path_len, DMC_UNRAR_EXTRACT_TEMP_SUFFIX,
+	       sizeof(DMC_UNRAR_EXTRACT_TEMP_SUFFIX));
+
+	file = dmc_unrar_fopen_write(temp_path);
+	if (!file) {
+		dmc_unrar_free(&archive->alloc, temp_path);
+		return DMC_UNRAR_OPEN_FAIL;
+	}
+
+	return_code = dmc_unrar_extract_file_to_file(archive, index, file, uncompressed_size, validate_crc);
 	fclose(file);
+
+	if (return_code == DMC_UNRAR_OK) {
+		if (!dmc_unrar_rename(temp_path, path)) {
+			dmc_unrar_unlink(temp_path);
+			return_code = DMC_UNRAR_WRITE_FAIL;
+			if (uncompressed_size)
+				*uncompressed_size = 0;
+		}
+	} else {
+		dmc_unrar_unlink(temp_path);
+		if (uncompressed_size)
+			*uncompressed_size = 0;
+	}
+
+	dmc_unrar_free(&archive->alloc, temp_path);
 	return return_code;
+}
+
+dmc_unrar_return dmc_unrar_extract_file_to_path(dmc_unrar_archive *archive, dmc_unrar_size_t index,
+	const char *path, dmc_unrar_size_t *uncompressed_size, bool validate_crc) {
+	return dmc_unrar_extract_file_to_path_impl(archive, index, path,
+		uncompressed_size, validate_crc, true);
+}
+
+dmc_unrar_return dmc_unrar_extract_file_to_path_unsafe(dmc_unrar_archive *archive,
+		dmc_unrar_size_t index, const char *path,
+		dmc_unrar_size_t *uncompressed_size, bool validate_crc) {
+	return dmc_unrar_extract_file_to_path_impl(archive, index, path,
+		uncompressed_size, validate_crc, false);
 }
 #endif /* DMC_UNRAR_DISABLE_STDIO */
 
@@ -10946,7 +11355,7 @@ static bool dmc_unrar_filters_init_stack(dmc_unrar_filters *filters) {
 		dmc_unrar_malloc(filters->alloc, filters->internal_state->stack_capacity,
 		                 sizeof(dmc_unrar_filters_stack_entry));
 
-	return filters->internal_state->filters != NULL;
+	return filters->internal_state->stack != NULL;
 }
 
 static bool dmc_unrar_filters_ensure_capacity_stack(dmc_unrar_filters *filters) {
