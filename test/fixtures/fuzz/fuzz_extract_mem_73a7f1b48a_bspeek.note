@@ -1,0 +1,7 @@
+fuzz_extract_mem: assert `bit_count > 0` in dmc_unrar_bs_peek_uint32
+(dmc_unrar.c:8592), called from dmc_unrar_huff_get_symbol via
+dmc_unrar_bs_peek_bits with a zero-width Huffman table. The RAR5
+decoder builds tables from archive-supplied code lengths; a malformed
+archive can produce a table with table_size == 0, which then asks the
+bitstream to peek 0 bits. 335-byte input, surfaced on the 60-second
+post-fix smoke run of fuzz_extract_mem. Follow-up work.

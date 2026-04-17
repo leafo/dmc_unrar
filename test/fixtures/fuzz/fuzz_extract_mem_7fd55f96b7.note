@@ -1,0 +1,6 @@
+fuzz_extract_mem: unbounded LZSS window allocation driven by the
+RAR5 dict_size field. A malformed archive can claim a dict_shift of
+up to 15 (0x20000 << 15 = 4 GiB). Fixed by capping dictionary
+allocations at DMC_UNRAR_MAX_DICT_SIZE (default 256 MiB) in
+dmc_unrar_lzss_create(); larger values now return
+DMC_UNRAR_INVALID_DATA. 335-byte minimized input.

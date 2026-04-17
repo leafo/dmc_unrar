@@ -454,6 +454,10 @@ static const struct {
 	const char *target;
 	const char *path;
 } fuzz_regressions[] = {
+	{ "fuzz_open_mem",      "test/fixtures/fuzz/fuzz_open_mem_5e69ffd712.rar" },
+	{ "fuzz_filename_stat", "test/fixtures/fuzz/fuzz_filename_stat_c84ffcca12.rar" },
+	{ "fuzz_extract_mem",   "test/fixtures/fuzz/fuzz_extract_mem_641db2ce06_lzss.rar" },
+	{ "fuzz_extract_mem",   "test/fixtures/fuzz/fuzz_extract_mem_7fd55f96b7.rar" },
 	{ NULL, NULL }
 };
 

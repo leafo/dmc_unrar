@@ -1,0 +1,8 @@
+fuzz_open_mem: infinite loop / very-slow parse in RAR5 header path.
+Discovered on the first 30-second smoke run of the libFuzzer harness.
+Stack (libFuzzer timeout signal): dmc_unrar_rar5_read_file_header ->
+dmc_unrar_rar5_read_number -> dmc_unrar_io_read_uint8.
+Likely cause: malformed extra-field walk driving the RAR5 header
+parser into a bounded-but-expensive loop that exceeds 25 seconds on
+a 129-byte input. Needs fix + regression test once a timeout-aware
+runner (fork + alarm) is added to runner.c.

@@ -1,0 +1,7 @@
+fuzz_extract_mem: assert failure in dmc_unrar_lzss_emit_copy() at
+dmc_unrar.c:9137 — `copy_offset <= lzss->window_offset` — triggered
+by a malformed compressed stream with an out-of-window back-reference.
+In NDEBUG builds the assertion vanishes and the function performs an
+out-of-bounds read into the LZSS window, so this is both a crash (in
+debug builds) and a potential information-disclosure bug (in release
+builds). Minimized to 111 bytes.
