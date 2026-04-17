@@ -256,6 +256,17 @@
 #define DMC_UNRAR_DISABLE_HEADER_CRC_CHECK 0
 #endif
 
+/* Maximum LZSS dictionary (sliding window) size the library will
+ * allocate per extraction, in bytes. Malformed archives can claim up to
+ * 4 GiB in their RAR5 header; without a cap here the decompressor
+ * allocates that memory on first extract. 256 MiB is a conservative
+ * default resource limit for typical use, not a format limit. Override
+ * to raise or lower if your workload demands it. Files declaring a
+ * larger dictionary return DMC_UNRAR_INVALID_DATA. */
+#ifndef DMC_UNRAR_MAX_DICT_SIZE
+#define DMC_UNRAR_MAX_DICT_SIZE (256u * 1024u * 1024u)
+#endif
+
 /* Do we have large file (>= 2GB) support? Can be defined to force enabling
  * or disabling of large file support, or kept undefined to let the
  * autodetection figure it out. The autodetection errs on being conservative,
@@ -2603,6 +2614,15 @@ static bool dmc_unrar_grow_files(dmc_unrar_archive *archive) {
 
 /* .--- Reading RAR blocks and file headers */
 
+/* Compute a + b in 64 bits, returning false on unsigned overflow. */
+static bool dmc_unrar_u64_add_ok(uint64_t a, uint64_t b, uint64_t *out) {
+	uint64_t r = a + b;
+	if (r < a)
+		return false;
+	*out = r;
+	return true;
+}
+
 /* Compute `block->start_pos + block->header_size + block->data_size` with
    overflow and end-of-stream checks. Returns false on overflow or when the
    end of the block would lie past the end of the archive stream. Used
@@ -3097,6 +3117,13 @@ static dmc_unrar_return dmc_unrar_rar4_read_file_header(dmc_unrar_archive *archi
 	return DMC_UNRAR_OK;
 }
 
+/* Upper bound on the advertised filename length for a RAR5 file entry.
+   The RAR5 format lets this field span a 64-bit varint, which lets a
+   malformed archive claim name_size == 0xFFFFFFFFFFFFFFFF and wrap the
+   extra-field walker's pos arithmetic. Sixty-four kilobytes is comfortably
+   above any real path length and still cheap to validate. */
+#define DMC_UNRAR_RAR5_NAME_MAX_LENGTH 65536
+
 /** Read a variable-length RAR5 number. */
 static bool dmc_unrar_rar5_read_number(dmc_unrar_io *io, uint64_t *number) {
 	int pos;
@@ -3313,18 +3340,55 @@ static dmc_unrar_return dmc_unrar_rar5_read_file_header(dmc_unrar_archive *archi
 	if (!dmc_unrar_rar5_read_number(&archive->io, &file->name_size))
 		return DMC_UNRAR_READ_FAIL;
 
+	/* Reject absurd name_size values. A malformed 64-bit varint here
+	   would otherwise wrap the extra-field walker's pos arithmetic
+	   below and turn the parse into an unbounded loop. */
+	if (file->name_size > (uint64_t)DMC_UNRAR_RAR5_NAME_MAX_LENGTH)
+		return DMC_UNRAR_INVALID_DATA;
+
 	/* The filename would be here now. Remember the offset. */
 	file->name_offset = dmc_unrar_io_tell(&archive->io);
 
 	file->is_encrypted = false;
 	file->is_link = dmc_unrar_rar_file_is_link(file);
 
+	{
+		/* Validate header layout: the block header is
+		     [fixed fields | name_size bytes | extra_size bytes]
+		   so header_end = start_pos + header_size, name_end must land
+		   at exactly header_end - extra_size, and the extra area is the
+		   final extra_size bytes of the header.
+
+		   Any mismatch is a malformed archive. Without these checks a
+		   file entry could, for example, claim a large name that runs
+		   past the header (making dmc_unrar_get_filename() return bytes
+		   from the following file data) or set name_end inside the
+		   declared extra area (making the walker below re-parse name
+		   bytes as records, or skip declared records entirely). */
+		uint64_t header_end, name_end;
+
+		if (!dmc_unrar_u64_add_ok(block->start_pos, block->header_size, &header_end))
+			return DMC_UNRAR_INVALID_DATA;
+		if (!dmc_unrar_u64_add_ok(file->name_offset, file->name_size, &name_end))
+			return DMC_UNRAR_INVALID_DATA;
+		if (name_end > header_end)
+			return DMC_UNRAR_INVALID_DATA;
+		/* extra_size must be exactly the gap between name_end and
+		   header_end; this covers the no-extras case (gap == 0) and
+		   the with-extras case in one expression. */
+		if (block->extra_size != header_end - name_end)
+			return DMC_UNRAR_INVALID_DATA;
+	}
+
 	if (block->extra_size) {
 		const uint64_t extra_end = block->start_pos + block->header_size;
-		uint64_t pos = dmc_unrar_io_tell(&archive->io) + file->name_size;
+		/* By the invariants just checked: extra_end == header_end and
+		   name_offset + name_size == extra_end - extra_size, i.e. the
+		   walker starts exactly at the extra area. */
+		uint64_t pos = file->name_offset + file->name_size;
 
 		while (pos < extra_end) {
-			uint64_t size, type;
+			uint64_t size, type, record_end, pos_after_size;
 
 			if (!dmc_unrar_io_seek(&archive->io, pos, DMC_UNRAR_SEEK_SET))
 				return DMC_UNRAR_SEEK_FAIL;
@@ -3332,10 +3396,26 @@ static dmc_unrar_return dmc_unrar_rar5_read_file_header(dmc_unrar_archive *archi
 			if (!dmc_unrar_rar5_read_number(&archive->io, &size))
 				return DMC_UNRAR_READ_FAIL;
 
-			pos = dmc_unrar_io_tell(&archive->io);
+			pos_after_size = dmc_unrar_io_tell(&archive->io);
+
+			/* `size` is the length of the remainder of the record
+			   (type + data), not counting the size varint itself. The
+			   record must be non-empty (a zero-size record has no room
+			   for the mandatory type field — otherwise we'd be reading
+			   the type from outside the record and, at the tail of the
+			   extra area, outside the block header entirely). The
+			   record also has to fit inside the declared extra area. */
+			if (!dmc_unrar_u64_add_ok(pos_after_size, size, &record_end))
+				return DMC_UNRAR_INVALID_DATA;
+			if (record_end <= pos_after_size || record_end > extra_end)
+				return DMC_UNRAR_INVALID_DATA;
 
 			if (!dmc_unrar_rar5_read_number(&archive->io, &type))
 				return DMC_UNRAR_READ_FAIL;
+
+			/* The type varint must fit inside the record. */
+			if ((uint64_t)dmc_unrar_io_tell(&archive->io) > record_end)
+				return DMC_UNRAR_INVALID_DATA;
 
 			switch (type) {
 				case DMC_UNRAR_FILE5_PROPERTY_ENCRYPTION:
@@ -3350,7 +3430,10 @@ static dmc_unrar_return dmc_unrar_rar5_read_file_header(dmc_unrar_archive *archi
 					break;
 			}
 
-			pos += size;
+			/* Jump to the next record. record_end > pos_after_size >
+			   pos (the size varint consumed at least one byte), so
+			   the loop is guaranteed to advance. */
+			pos = record_end;
 		}
 	}
 
@@ -5066,6 +5149,13 @@ typedef struct dmc_unrar_lzss_tag {
 	dmc_unrar_size_t copy_offset; /**< Overhang copy offset. */
 	dmc_unrar_size_t copy_size;   /**< Overhang copy size. */
 
+	/** Set when dmc_unrar_lzss_emit_copy() is asked to copy from before
+	    the start of the stream (malformed back-reference). Each RAR-
+	    version decompress loop checks this after decoding a symbol and
+	    fails with DMC_UNRAR_INVALID_DATA, so the caller gets a clean
+	    error instead of corrupted output. */
+	bool error;
+
 } dmc_unrar_lzss;
 
 /** Create an LZSS decoder, allocating a window buffer of the specified size (must be a power of 2!). */
@@ -5850,6 +5940,11 @@ static dmc_unrar_return dmc_unrar_rar15_decompress(dmc_unrar_rar15_context *ctx)
 	}
 
 	while (ctx->ctx->buffer_offset < ctx->ctx->buffer_size) {
+		/* A previous symbol produced an out-of-window back-reference.
+		   Fail the decompress cleanly instead of producing garbage. */
+		if (ctx->ctx->lzss.error)
+			return DMC_UNRAR_INVALID_DATA;
+
 		if (dmc_unrar_lzss_has_overhang(&ctx->ctx->lzss)) {
 			ctx->ctx->buffer_offset = dmc_unrar_lzss_emit_copy_overhang(&ctx->ctx->lzss, ctx->ctx->buffer,
 			                          ctx->ctx->buffer_size, ctx->ctx->buffer_offset, NULL);
@@ -6411,6 +6506,9 @@ static dmc_unrar_return dmc_unrar_rar20_decompress(dmc_unrar_rar20_context *ctx)
 		uint8_t literal;
 		uint32_t symbol;
 		dmc_unrar_size_t offset, length;
+
+		if (ctx->ctx->lzss.error)
+			return DMC_UNRAR_INVALID_DATA;
 
 		if (dmc_unrar_lzss_has_overhang(&ctx->ctx->lzss)) {
 			ctx->ctx->buffer_offset = dmc_unrar_lzss_emit_copy_overhang(&ctx->ctx->lzss, ctx->ctx->buffer,
@@ -7008,6 +7106,9 @@ static dmc_unrar_return dmc_unrar_rar30_decompress_block(dmc_unrar_rar30_context
 	(void)stop_at_filter;
 
 	while (*buffer_offset < buffer_size) {
+		if (ctx->ctx->lzss.error)
+			return DMC_UNRAR_INVALID_DATA;
+
 		if (dmc_unrar_bs_has_error(&ctx->ctx->bs))
 			break;
 
@@ -7846,6 +7947,9 @@ static dmc_unrar_return dmc_unrar_rar50_decompress_block(dmc_unrar_rar50_context
 	(void)stop_at_filter;
 
 	while (*buffer_offset < buffer_size) {
+		if (ctx->ctx->lzss.error)
+			return DMC_UNRAR_INVALID_DATA;
+
 		if (dmc_unrar_bs_has_error(&ctx->ctx->bs))
 			break;
 
@@ -9070,6 +9174,13 @@ static dmc_unrar_return dmc_unrar_lzss_create(dmc_unrar_alloc *alloc, dmc_unrar_
 	DMC_UNRAR_ASSERT(alloc && lzss);
 	DMC_UNRAR_ASSERT(window_size && dmc_unrar_is_power_2(window_size));
 
+	/* Reject dictionaries past the configured cap. A RAR5 archive can
+	   legally claim up to 4 GiB here; refusing to allocate past
+	   DMC_UNRAR_MAX_DICT_SIZE is the primary defense against
+	   archive-driven OOM. */
+	if (window_size > (dmc_unrar_size_t)DMC_UNRAR_MAX_DICT_SIZE)
+		return DMC_UNRAR_INVALID_DATA;
+
 	DMC_UNRAR_CLEAR_OBJ(*lzss);
 
 	lzss->alloc = alloc;
@@ -9134,7 +9245,18 @@ static dmc_unrar_size_t dmc_unrar_lzss_emit_copy(dmc_unrar_lzss *lzss, uint8_t *
 		dmc_unrar_size_t *running_output_count) {
 
 	DMC_UNRAR_ASSERT(lzss);
-	DMC_UNRAR_ASSERT(copy_offset <= lzss->window_offset);
+
+	/* A malformed compressed stream can ask us to copy from before the
+	   start of the window. The window-mask read below would still be
+	   memory-safe (mask forces the index back into the buffer) but the
+	   bytes we'd emit are garbage. Flag the error for the enclosing
+	   decompress loop to pick up and don't emit anything for this copy. */
+	if (copy_offset > lzss->window_offset) {
+		lzss->error = true;
+		lzss->copy_offset = 0;
+		lzss->copy_size   = 0;
+		return buffer_offset;
+	}
 
 	/* Convert relative offset into absolute output buffer offset. */
 	copy_offset = lzss->window_offset - copy_offset;
@@ -9179,6 +9301,10 @@ static dmc_unrar_size_t dmc_unrar_lzss_emit_copy_overhang(dmc_unrar_lzss *lzss, 
 	dmc_unrar_size_t buffer_size, dmc_unrar_size_t buffer_offset, dmc_unrar_size_t *running_output_count) {
 
 	DMC_UNRAR_ASSERT(lzss);
+
+	/* Short-circuit if a previous emit_copy already flagged an error. */
+	if (lzss->error)
+		return buffer_offset;
 
 	if (lzss->copy_size == 0)
 		return buffer_offset;
