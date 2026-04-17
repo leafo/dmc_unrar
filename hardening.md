@@ -13,6 +13,11 @@ A first critical-fixes pass has landed. Completed:
 - Phase 3 subset: memory-reader seek validation, allocation overflow in
   default wrappers, block-span overflow check before seeks, RAR4 header
   CRC validation (gated by `DMC_UNRAR_DISABLE_HEADER_CRC_CHECK`).
+- Phase 7 infrastructure: three libFuzzer harnesses
+  (`open_mem` / `filename_stat` / `extract_mem`), seed corpus, crash
+  minimization script, and a regression hook in `runner.c`. Fuzzing
+  is out-of-band (local only, not in CI); fuzz-found bug fixtures
+  live under `test/fixtures/fuzz/`.
 - Phase 5 subset: `dmc_unrar_extract_file_to_path()` now rejects unsafe
   archive filenames (traversal, absolute, UNC, drive prefix) by default
   and returns `DMC_UNRAR_FILE_UNSAFE_PATH`. Path extraction is also
@@ -20,12 +25,26 @@ A first critical-fixes pass has landed. Completed:
   half-written output. The legacy behavior is still available through
   `dmc_unrar_extract_file_to_path_unsafe()`.
 
-Still outstanding (tracked below): Phase 0 (formal support contract),
-most of Phase 3 (configurable caps, RAR5 header CRC coverage, VLQ
-overlong-encoding hardening beyond what already exists), Phase 4 (RAR5
-solid archives produced by `rar` 7.x currently fail extraction after the
-first file), Phase 6 (resource limits), Phase 7 (fuzzing), and Phase 8
-(documentation pass).
+Still outstanding (tracked below):
+
+- Phase 0: formal support contract.
+- Phase 1 tail: static analyzer pass, volumes/RAR4 corpus coverage.
+- Phase 3 tail: configurable caps, RAR5 header CRC coverage audit, RAR5
+  VLQ overlong-encoding targeted test, broader `items * size` audit,
+  sub-reader seek audit.
+- Phase 4: RAR5 solid archives produced by `rar` 7.x currently fail
+  extraction after the first file.
+- Phase 5 tail: UTF-8 enforcement in the safety check, Windows-reserved-
+  name rejection, opt-in overwrite protection.
+- Phase 6: resource limits.
+- Phase 7 tail: fix the three fuzz findings under `test/fixtures/fuzz/`
+  (two RAR5 hangs, one LZSS OOB read) and wire them into
+  `fuzz_regressions[]`. Add a fork/timeout isolation layer to
+  `runner.c` so hang-class fixtures can live in the regression table.
+- Phase 8: documentation pass.
+
+CI currently runs on Ubuntu x86_64 and arm64 (`ubuntu-latest` +
+`ubuntu-24.04-arm`).
 
 
 ## Goals
@@ -57,23 +76,33 @@ Acceptance criteria:
 
 ## Phase 1: Build A Safety Baseline
 
-- [ ] Add C tests for public APIs: open, list, stat, filename, extract-to-mem,
+- [x] Add C tests for public APIs: open, list, stat, filename, extract-to-mem,
       extract-to-heap, extract-to-file, and callback extraction.
-- [ ] Add a golden archive corpus generated locally with `rar` and validated
-      with `unrar`.
-- [ ] Include archives for simple RAR5, multi-file RAR5, solid RAR5, encrypted
-      file data, encrypted headers, traversal names, corrupt CRC, truncated
-      archive, links, and volumes.
-- [ ] Add differential extraction tests against `unrar`.
-- [ ] Add compile checks for the advertised C89/GNU89 warning profiles.
-- [ ] Add ASan/UBSan test runs.
+      (`test/runner.c`)
+- [x] Add a golden archive corpus generated locally with `rar` and validated
+      with `unrar`. (`test/corpus/build.sh`)
+- [x] Include archives for simple RAR5, solid RAR5, encrypted file data,
+      encrypted headers, corrupt CRC, truncated archive, and links.
+      Traversal names are covered as a unit test of the safety helper
+      instead of a corpus archive (modern `rar` refuses to emit such
+      names). Volumes and a RAR4 sample are still missing — `rar` 7.x
+      dropped RAR4 writing support, so a checked-in fixture would be
+      needed.
+- [x] Add differential extraction tests against `unrar`. (`test/diff.sh`,
+      currently limited to `simple.rar` — `solid.rar` is skipped because
+      of the known Phase 4 RAR5-solid regression.)
+- [x] Add compile checks for the advertised C89/GNU89 warning profiles.
+      (`make -C test c89`)
+- [x] Add ASan/UBSan test runs. (`make -C test test-asan / test-ubsan`)
 - [ ] Add a static analyzer run.
 
 Acceptance criteria:
 
-- [ ] Current known failures are captured as failing tests or expected-failure
-      tests.
-- [ ] The test suite can be run with a single documented command.
+- [x] Current known failures are captured as failing tests or expected-failure
+      tests. (Regression tests for each Phase 2 bug were added alongside
+      the fixes.)
+- [x] The test suite can be run with a single documented command.
+      (`make -C test test`; CI runs the full matrix on x86_64 and arm64.)
 
 ## Phase 2: Immediate Correctness And Safety Fixes
 
@@ -93,33 +122,49 @@ Acceptance criteria:
 
 Acceptance criteria:
 
-- [ ] ASan passes for corrupt CRC heap extraction.
-- [ ] Encrypted RAR5 headers fail with an explicit unsupported-encryption
+- [x] ASan passes for corrupt CRC heap extraction.
+- [x] Encrypted RAR5 headers fail with an explicit unsupported-encryption
       error.
-- [ ] Callback extraction behavior matches the public documentation.
+- [x] Callback extraction behavior matches the public documentation.
 
 ## Phase 3: Harden Archive Parsing
 
 - [ ] Add checked integer arithmetic helpers for addition, multiplication, and
-      stream offset calculations.
-- [ ] Add allocation overflow checks around all `items * size` calculations.
-- [ ] Validate memory-reader and sub-reader seek targets: no negative offsets,
-      no offset overflow, and no invalid offset past stream bounds.
-- [ ] Validate block spans before seeking: `start_pos + header_size +
+      stream offset calculations. (One-off helpers added ad hoc
+      -- `dmc_unrar_size_mul_ok`, `dmc_unrar_block_end_pos` -- but no
+      general set of helpers yet.)
+- [x] Add allocation overflow checks around `items * size` in the default
+      allocator wrappers. A broader audit of every internal call site is
+      still outstanding.
+- [x] Validate memory-reader seek targets: no negative offsets, no offset
+      overflow, and no invalid offset past stream bounds. (Sub-reader
+      currently delegates to the parent and inherits those checks; a
+      dedicated pass on the sub-reader path would still be worthwhile.)
+- [x] Validate block spans before seeking: `start_pos + header_size +
       data_size` must not overflow and must not exceed stream size.
+      (Wired into both RAR4 and RAR5 collect loops.)
 - [ ] Validate RAR5 variable-length integers and reject overlong encodings or
-      shifts beyond 63 bits.
-- [ ] Validate RAR4 header CRCs where available.
-- [ ] Validate RAR5 header CRCs where available.
+      shifts beyond 63 bits. (Existing decoder already bounds the bit
+      position to 70 before returning; a targeted audit + test has not
+      been done.)
+- [x] Validate RAR4 header CRCs where available. (Enforced by default;
+      opt-out via `DMC_UNRAR_DISABLE_HEADER_CRC_CHECK=1`.)
+- [ ] Validate RAR5 header CRCs where available. (Library reports
+      `DMC_UNRAR_50_BLOCK_CHECKSUM_NO_MATCH` from some code paths; full
+      coverage not audited.)
 - [ ] Add configurable caps for file count, block count, filename length,
       comment size, filter count, filter stack depth, metadata allocation, and
       total archive metadata.
 
 Acceptance criteria:
 
-- [ ] Truncated archives fail cleanly under ASan/UBSan.
-- [ ] Malformed block sizes fail cleanly without invalid reads or seeks.
+- [x] Truncated archives fail cleanly under ASan/UBSan.
+      (`truncated_does_not_crash` regression test.)
+- [~] Malformed block sizes fail cleanly without invalid reads or seeks.
+      (Block-span overflow now caught; broader fuzzing-driven coverage
+      is Phase 7.)
 - [ ] Malformed archives cannot trigger unbounded memory allocation.
+      (Still depends on the caps above.)
 
 ## Phase 4: Fix Extraction Correctness
 
@@ -140,24 +185,40 @@ Acceptance criteria:
 
 ## Phase 5: Provide App-Safe Filesystem Extraction
 
-- [ ] Add or document a safe extraction wrapper for app use.
-- [ ] Normalize separators before validation.
-- [ ] Reject absolute paths.
-- [ ] Reject `..` path components.
-- [ ] Reject Windows drive prefixes.
-- [ ] Reject UNC-style paths.
-- [ ] Reject invalid UTF-8 names if the app requires UTF-8.
+- [x] Add or document a safe extraction wrapper for app use.
+      `dmc_unrar_extract_file_to_path()` is now safe by default and
+      returns `DMC_UNRAR_FILE_UNSAFE_PATH` for risky archive names.
+      `dmc_unrar_extract_file_to_path_unsafe()` restores the legacy
+      behavior.
+- [x] Normalize separators before validation. (`get_filename()` already
+      normalizes to forward slashes; the safety check also rejects any
+      surviving backslash.)
+- [x] Reject absolute paths.
+- [x] Reject `..` path components.
+- [x] Reject Windows drive prefixes.
+- [x] Reject UNC-style paths.
+- [ ] Reject invalid UTF-8 names if the app requires UTF-8. (Library
+      provides `dmc_unrar_unicode_is_valid_utf8()` but the safe-path
+      check does not enforce it yet.)
 - [ ] Reject or sanitize reserved platform names where relevant.
+      (`CON`, `PRN`, `AUX`, `NUL`, `COMx`, `LPTx` on Windows.)
 - [ ] Prevent overwriting existing files unless explicitly allowed.
-- [ ] Extract to a temporary file, validate CRC, then rename into place.
-- [ ] Never create symlinks, hardlinks, devices, FIFOs, or sockets.
+      (Current rename step uses `MOVEFILE_REPLACE_EXISTING` / POSIX
+      rename semantics — it will overwrite.)
+- [x] Extract to a temporary file, validate CRC, then rename into place.
+- [x] Never create symlinks, hardlinks, devices, FIFOs, or sockets.
+      (Library refuses link entries via `DMC_UNRAR_FILE_UNSUPPORTED_LINK`
+      and only ever writes through stdio / WIN32 file handles.)
 
 Acceptance criteria:
 
-- [ ] Malicious archive names cannot write outside the extraction root on
-      Linux, macOS, or Windows.
-- [ ] Partial failed extraction does not leave files that look successfully
-      extracted.
+- [~] Malicious archive names cannot write outside the extraction root on
+      Linux, macOS, or Windows. (Unit-tested on Linux; Windows-specific
+      patterns — drive + UNC — are rejected by the same helper but not
+      integration-tested on a Windows runner.)
+- [x] Partial failed extraction does not leave files that look successfully
+      extracted. (Atomic temp + rename; `path_extract_no_partial_on_fail`
+      regression test.)
 
 ## Phase 6: Add Resource Limits
 
@@ -179,17 +240,33 @@ Acceptance criteria:
 
 ## Phase 7: Fuzzing
 
-- [ ] Add a libFuzzer target for `dmc_unrar_archive_open_mem()`.
-- [ ] Add a libFuzzer target that extracts the first supported file from small
-      archives.
-- [ ] Seed fuzzing with the golden archive corpus.
-- [ ] Run fuzzing with ASan and UBSan.
+- [x] Add a libFuzzer target for `dmc_unrar_archive_open_mem()`.
+      (`test/fuzz/fuzz_open_mem.c`)
+- [x] Add a libFuzzer target that extracts the first supported file from small
+      archives. (`test/fuzz/fuzz_extract_mem.c`; also a metadata-only
+      harness `fuzz_filename_stat.c`.)
+- [x] Seed fuzzing with the golden archive corpus. (`make -C test/fuzz seed`
+      hard-links `test/corpus/*.rar` and `test/fixtures/*.rar` into
+      `test/fuzz/seed/`.)
+- [x] Run fuzzing with ASan and UBSan. (Harnesses compile with
+      `-fsanitize=fuzzer,address,undefined`.)
 - [ ] Convert every discovered crash or hang into a regression test.
+      Infra in place (`test/fuzz/minimize.sh` +
+      `fuzz_regressions[]` table in `runner.c`). Per the fixtures
+      README, fixtures land pre-fix for repro preservation but only
+      get wired into the regression table once the underlying bug is
+      fixed — the main suite has no fork/timeout isolation yet.
 
 Acceptance criteria:
 
-- [ ] Initial fuzzing finds no unfixed crashes over a documented run duration.
-- [ ] Fuzz regressions run in CI or in a documented local hardening command.
+- [~] Initial fuzzing finds no unfixed crashes over a documented run
+      duration. Initial 30-second smoke runs surfaced three bugs
+      (two RAR5 header/metadata hangs and one RAR5 LZSS out-of-window
+      back-reference assert). Fixtures are in `test/fixtures/fuzz/`
+      with `.note` files; fixes are Phase-7 follow-up work.
+- [ ] Fuzz regressions run in CI. (Out-of-band only by design; see
+      `test/fuzz/README.md`. Regression replay of fixed fuzz bugs
+      runs in CI via the normal `runner.c` suite.)
 
 ## Phase 8: Documentation And Integration Decision
 

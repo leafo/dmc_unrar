@@ -439,6 +439,69 @@ static int test_path_extract_no_partial_on_fail(void) {
 	return 0;
 }
 
+/* Phase 7 fuzzing regressions. As crashes are discovered by the
+ * libFuzzer harnesses under test/fuzz/, minimize.sh saves a fixture
+ * under test/fixtures/fuzz/ and we add an entry here. The test only
+ * asserts no memory corruption — it does not assert a specific return
+ * code — so a fixture can land before the underlying bug is fixed.
+ * The ASan build of the suite is what turns a "no crash" result into
+ * a real safety check.
+ *
+ * The `target` field names which harness originally produced the
+ * fixture (open / filename / extract); we replay each fixture through
+ * the matching API surface. */
+static const struct {
+	const char *target;
+	const char *path;
+} fuzz_regressions[] = {
+	{ NULL, NULL }
+};
+
+static int test_fuzz_regressions(void) {
+	size_t i;
+	for (i = 0; fuzz_regressions[i].path != NULL; i++) {
+		const char *target = fuzz_regressions[i].target;
+		const char *path   = fuzz_regressions[i].path;
+		dmc_unrar_archive a;
+
+		if (dmc_unrar_archive_init(&a) != DMC_UNRAR_OK)
+			continue;
+		if (dmc_unrar_archive_open_path(&a, path) != DMC_UNRAR_OK) {
+			dmc_unrar_archive_close(&a);
+			continue;
+		}
+
+		if (target && strcmp(target, "fuzz_filename_stat") == 0) {
+			dmc_unrar_size_t n = dmc_unrar_get_file_count(&a), j;
+			for (j = 0; j < n; j++) {
+				char buf[1024];
+				(void)dmc_unrar_get_file_stat(&a, j);
+				(void)dmc_unrar_file_is_directory(&a, j);
+				(void)dmc_unrar_file_is_supported(&a, j);
+				(void)dmc_unrar_get_filename(&a, j, buf, sizeof(buf));
+			}
+		} else if (target && strcmp(target, "fuzz_extract_mem") == 0) {
+			dmc_unrar_size_t n = dmc_unrar_get_file_count(&a), j;
+			for (j = 0; j < n; j++) {
+				void *out = NULL;
+				dmc_unrar_size_t out_size = 0;
+				const dmc_unrar_file *stat_;
+				if (dmc_unrar_file_is_directory(&a, j)) continue;
+				if (dmc_unrar_file_is_supported(&a, j) != DMC_UNRAR_OK) continue;
+				stat_ = dmc_unrar_get_file_stat(&a, j);
+				if (!stat_ || stat_->uncompressed_size > (16u * 1024u * 1024u)) continue;
+				(void)dmc_unrar_extract_file_to_heap(&a, j, &out, &out_size, true);
+				free(out);
+				break;
+			}
+		}
+		/* Default: open + close, matching fuzz_open_mem. */
+
+		dmc_unrar_archive_close(&a);
+	}
+	return 0;
+}
+
 /* --- test registry ------------------------------------------------------- */
 
 typedef int (*test_fn)(void);
@@ -462,6 +525,7 @@ static const test_entry tests[] = {
 	{ "filename_is_safe_helper",      test_filename_is_safe_helper },
 	{ "extract_to_path_safe_default", test_extract_to_path_safe_default },
 	{ "extract_to_path_unsafe_variant", test_extract_to_path_unsafe_variant },
+	{ "fuzz_regressions",             test_fuzz_regressions },
 };
 
 int main(int argc, char **argv) {

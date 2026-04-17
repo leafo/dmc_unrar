@@ -2,3 +2,14 @@ runner
 runner-asan
 runner-ubsan
 example_unrar
+
+# Fuzz harness artifacts
+fuzz/fuzz_open_mem
+fuzz/fuzz_filename_stat
+fuzz/fuzz_extract_mem
+fuzz/seed/
+fuzz/work/
+fuzz/crash-*
+fuzz/timeout-*
+fuzz/oom-*
+fuzz/leak-*
