@@ -33,10 +33,28 @@ landed. Completed:
   driven by a RAR5 header field), and a zero-width / uninitialized
   Huffman decode path that drove an assert in
   `dmc_unrar_bs_peek_uint32`. All five fixtures run under ASan in
-  `test_fuzz_regressions`.
-- Phase 6 starter: `DMC_UNRAR_MAX_DICT_SIZE` (default 256 MiB) caps
-  the LZSS window allocation per extraction. The full Phase 6 caps
-  (file count, total size, etc.) are still outstanding.
+  `test_fuzz_regressions`. One new finding (zero-length RAR5 filter
+  assert in `dmc_unrar_rar50_decompress`) is pending fix — fixture
+  `fuzz_extract_mem_34d0acd798_filter0.rar` is checked in under
+  `test/fixtures/fuzz/` with the two-phase "awaiting fix" status.
+- Phase 6 caps: alongside `DMC_UNRAR_MAX_DICT_SIZE` (LZSS window,
+  default 256 MiB), the library now enforces
+  `DMC_UNRAR_MAX_FILE_COUNT` (default 1,000,000),
+  `DMC_UNRAR_MAX_FILE_SIZE` (declared uncompressed per entry, default
+  16 GiB), `DMC_UNRAR_MAX_TOTAL_SIZE` (cumulative declared
+  uncompressed, default 256 GiB),
+  `DMC_UNRAR_MAX_COMPRESSION_RATIO` (per-entry
+  uncompressed/compressed ratio, default 1000), and
+  `DMC_UNRAR_MAX_PPMD_SIZE_MB` (archive-declared PPMd heap, default
+  32). File-count, file-size, total-size, and ratio caps fire at
+  open/list time in the RAR4 and RAR5 block-collection loops, after
+  a real file header is parsed (archive-sub / service / comment
+  metadata re-parses don't touch the running total). The PPMd cap
+  fires when the decompressor reads the per-block heap hint. Ratio
+  check uses overflow-checked multiplication, not floor division,
+  so values just above the cap can't sneak through.
+  Callback-driven cancellation and a list-only mode are still
+  outstanding.
 - Phase 5 subset: `dmc_unrar_extract_file_to_path()` now rejects unsafe
   archive filenames (traversal, absolute, UNC, drive prefix) by default
   and returns `DMC_UNRAR_FILE_UNSAFE_PATH`. Path extraction is also
@@ -55,9 +73,10 @@ Still outstanding (tracked below):
   extraction after the first file.
 - Phase 5 tail: UTF-8 enforcement in the safety check, Windows-reserved-
   name rejection, opt-in overwrite protection.
-- Phase 6: remaining resource limits (max file count, max total
-  uncompressed size, max compression ratio, PPMd memory cap).
-  `DMC_UNRAR_MAX_DICT_SIZE` is the first of these and is in place.
+- Phase 6 tail: callback-driven cancellation / timeout mechanism, and
+  a list-only mode that avoids allocating decompressor state. The
+  archive-bomb caps (file count, per-file size, total size,
+  compression ratio, PPMd heap) all landed in this round.
 - Phase 7 tail: add a fork/timeout isolation layer to `runner.c` so
   hang/crash-class fixtures can land in the regression table pre-fix,
   extend fuzzing beyond 60-second smoke runs once the Phase-6 caps
@@ -243,22 +262,37 @@ Acceptance criteria:
 
 ## Phase 6: Add Resource Limits
 
-- [ ] Add a configurable maximum file count.
-- [ ] Add a configurable maximum single-file uncompressed size.
-- [ ] Add a configurable maximum total uncompressed size.
-- [ ] Add a configurable maximum compression ratio.
+- [x] Add a configurable maximum file count.
+      (`DMC_UNRAR_MAX_FILE_COUNT`, default 1,000,000.)
+- [x] Add a configurable maximum single-file uncompressed size.
+      (`DMC_UNRAR_MAX_FILE_SIZE`, default 16 GiB.)
+- [x] Add a configurable maximum total uncompressed size.
+      (`DMC_UNRAR_MAX_TOTAL_SIZE`, default 256 GiB.)
+- [x] Add a configurable maximum compression ratio.
+      (`DMC_UNRAR_MAX_COMPRESSION_RATIO`, default 1000:1; only
+      enforced on entries with non-zero compressed data so
+      symlinks are unaffected.)
 - [x] Add a configurable maximum dictionary size.
       (`DMC_UNRAR_MAX_DICT_SIZE`, default 256 MiB.)
-- [ ] Add a configurable maximum PPMd memory size.
+- [x] Add a configurable maximum PPMd memory size.
+      (`DMC_UNRAR_MAX_PPMD_SIZE_MB`, default 32 MiB, only enforced
+      when the archive explicitly declares a heap size.)
 - [ ] Add callback-driven cancellation or another app-controlled timeout
       mechanism.
 - [ ] Add a list-only mode that avoids allocating decompressor state.
 
 Acceptance criteria:
 
-- [ ] Archive bombs fail with deterministic limit errors.
-- [ ] Limit failures do not leave partial trusted output.
-- [ ] Limits are documented and test-covered.
+- [~] Archive bombs fail with deterministic limit errors. All caps
+      return `DMC_UNRAR_INVALID_DATA` deterministically at
+      open/extract time; the cap smoke tests
+      (`make -C test test-caps`) exercise the file-count, per-file,
+      and total-size caps.
+- [x] Limit failures do not leave partial trusted output. Caps fire
+      before extraction starts (open-time caps) or before the
+      decompressor writes any output byte (PPMd cap).
+- [~] Limits are documented and test-covered. Defines are documented
+      inline; test-caps covers three of the five caps.
 
 ## Phase 7: Fuzzing
 

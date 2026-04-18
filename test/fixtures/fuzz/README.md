@@ -47,7 +47,9 @@ now return cleanly and run under ASan in `test_fuzz_regressions`.
 
 ## Awaiting fix
 
-None currently.
+| Fixture | What it exposes |
+|---------|-----------------|
+| `fuzz_extract_mem_34d0acd798_filter0.rar` | RAR5 decompress assert on a zero-length filter (`dmc_unrar_filters_get_first_length > 0`), 195 bytes. Surfaced on the 60-second smoke run after the Phase 6 caps landed. |
 
 New fuzz findings land as new fixtures here; until a fork/alarm
 isolation layer is added to `runner.c`, crash-/hang-class fixtures
