@@ -7167,7 +7167,13 @@ static dmc_unrar_return dmc_unrar_rar30_decompress(dmc_unrar_rar30_context *ctx)
 			if (return_code != DMC_UNRAR_OK)
 				return return_code;
 
-			DMC_UNRAR_ASSERT(ctx->filter_offset == filter_length);
+			/* The block decoder can return OK on a truncated LZ stream that
+			   ran dry before filling the whole filter input. A malformed
+			   archive can trigger this; trusting the length invariant
+			   aborts under `-DNDEBUG`-less builds, so treat the short fill
+			   as invalid data. */
+			if (ctx->filter_offset != filter_length)
+				return DMC_UNRAR_INVALID_DATA;
 		}
 
 		/* We have a filter and its memory data now. */
@@ -8011,7 +8017,9 @@ static dmc_unrar_return dmc_unrar_rar50_decompress(dmc_unrar_rar50_context *ctx)
 			if (return_code != DMC_UNRAR_OK)
 				return return_code;
 
-			DMC_UNRAR_ASSERT(ctx->filter_offset == filter_length);
+			/* Same short-fill guard as the rar30 path above. */
+			if (ctx->filter_offset != filter_length)
+				return DMC_UNRAR_INVALID_DATA;
 		}
 
 		/* We have a filter and its memory data now. */
@@ -11226,7 +11234,7 @@ static dmc_unrar_return dmc_unrar_filters_rar4_parse(dmc_unrar_filters *filters,
 	} else
 		filter_length = dmc_unrar_filters_rar4_read_number(&bs);
 
-	if (filter_length >= DMC_UNRAR_FILTERS_MEMORY_SIZE)
+	if (filter_length == 0 || filter_length >= DMC_UNRAR_FILTERS_MEMORY_SIZE)
 		return DMC_UNRAR_FILTERS_INVALID_LENGTH;
 
 	/* Registers. */
@@ -12001,6 +12009,13 @@ static dmc_unrar_return dmc_unrar_filters_rar5_parse(dmc_unrar_filters *filters,
 	dmc_unrar_size_t filter_offset = dmc_unrar_filters_rar5_read_number(bs) + current_output_offset;
 	dmc_unrar_size_t filter_length = dmc_unrar_filters_rar5_read_number(bs);
 	uint8_t filter_type = dmc_unrar_bs_read_bits(bs, 3);
+
+	/* A zero-length filter would make the decompressor ask the bitstream
+	   for a zero-byte block and wedge the subsequent fixed asserts; an
+	   oversized one would exceed the filter memory bound. Both are
+	   malformed inputs. */
+	if (filter_length == 0 || filter_length >= DMC_UNRAR_FILTERS_MEMORY_SIZE)
+		return DMC_UNRAR_FILTERS_INVALID_LENGTH;
 
 	if (!dmc_unrar_filters_grow_filters(filters))
 		return DMC_UNRAR_ALLOC_FAIL;

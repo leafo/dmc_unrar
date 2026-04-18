@@ -39,17 +39,20 @@ prefix of a content hash so different crashes don't collide.
 | `fuzz_extract_mem_641db2ce06_lzss.rar` | RAR5 LZSS out-of-window back-reference (assert abort), 111 bytes. |
 | `fuzz_extract_mem_7fd55f96b7.rar` | Unbounded LZSS dictionary allocation (up to 4 GiB from one 64-bit header field), 335 bytes. |
 | `fuzz_extract_mem_73a7f1b48a_bspeek.rar` | Huffman decode on an uninitialized / zero-width table, 335 bytes. |
+| `fuzz_extract_mem_34d0acd798_filter0.rar` | RAR5 zero-length filter assert in `dmc_unrar_rar50_decompress`, 195 bytes. |
+| `fuzz_extract_mem_3e8c033a03_filterunderrun.rar` | RAR5 short-fill from `rar50_decompress_block` into a filter input slot (`filter_offset != filter_length` at dmc_unrar.c:8014), 161 bytes. |
 
 First three surfaced on the initial 30-second smoke runs; the OOM was
 found on the first post-fix 60-second smoke run, followed by the
-zero-width Huffman table crash on the next extract smoke run. All five
-now return cleanly and run under ASan in `test_fuzz_regressions`.
+zero-width Huffman table crash on the next extract smoke run. The
+zero-length filter crash surfaced on the 60-second smoke run taken
+right after the Phase 6 caps landed. The filter-underrun crash
+surfaced on the first 10-minute post-Phase-6 smoke run. All seven now
+return cleanly and run under ASan in `test_fuzz_regressions`.
 
 ## Awaiting fix
 
-| Fixture | What it exposes |
-|---------|-----------------|
-| `fuzz_extract_mem_34d0acd798_filter0.rar` | RAR5 decompress assert on a zero-length filter (`dmc_unrar_filters_get_first_length > 0`), 195 bytes. Surfaced on the 60-second smoke run after the Phase 6 caps landed. |
+None currently.
 
 New fuzz findings land as new fixtures here; until a fork/alarm
 isolation layer is added to `runner.c`, crash-/hang-class fixtures

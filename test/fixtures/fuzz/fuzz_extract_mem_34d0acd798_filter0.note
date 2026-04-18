@@ -1,10 +1,11 @@
 fuzz_extract_mem: assert `dmc_unrar_filters_get_first_length(&ctx->filters) > 0`
-at dmc_unrar.c:7980 inside dmc_unrar_rar50_decompress. The RAR5 LZ
+at dmc_unrar.c:7997 inside dmc_unrar_rar50_decompress. The RAR5 LZ
 path pulls the next filter from the filter queue and expects its
 length to be non-zero, but a malformed archive can declare a
-zero-length filter that slips through filters_empty(). 195-byte
-input, surfaced on the 60-second fuzz_extract_mem smoke run taken
-right after Phase 6 caps (file-count/file-size/total-size/ratio/PPMd)
-landed. Awaiting fix: needs a runtime rejection of zero-length
-filters, analogous to the earlier zero-width Huffman table fix, before
-the fixture can be wired into fuzz_regressions[].
+zero-length filter via the unchecked VLQ at
+dmc_unrar_filters_rar5_parse (dmc_unrar.c:12002). 195-byte input,
+surfaced on the 60-second fuzz_extract_mem smoke run taken right
+after Phase 6 caps (file-count/file-size/total-size/ratio/PPMd)
+landed. Fixed by rejecting filter_length == 0 at parse time in both
+the RAR4 and RAR5 filter parsers (shares the existing
+DMC_UNRAR_FILTERS_INVALID_LENGTH return with the oversize check).

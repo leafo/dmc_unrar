@@ -1,0 +1,11 @@
+fuzz_extract_mem: assert `ctx->filter_offset == filter_length` at
+dmc_unrar.c:8014 inside dmc_unrar_rar50_decompress. After the
+decompressor is asked to fill filter_length bytes into filter memory
+(dmc_unrar_rar50_decompress_block call at line 8008), it returns
+DMC_UNRAR_OK without having written the full expected byte count,
+leaving filter_offset < filter_length. A malformed RAR5 stream can
+terminate or run dry while a filter slot is still waiting for input.
+161-byte minimized input, surfaced on the 10-minute post-Phase-6
+fuzz_extract_mem run. Fixed by turning the ASSERT at 8014 into a
+runtime check that returns DMC_UNRAR_INVALID_DATA on a short fill;
+the symmetric rar30 path at dmc_unrar.c:7170 got the same guard.
