@@ -1,0 +1,18 @@
+fuzz_extract_mem: two issues in one 152-byte minimized input.
+
+1. UBSan at dmc_unrar.c:8152 (dmc_unrar_rar50_read_block_header):
+   `block_size += value << (i * 8)` where `value` is uint8_t. When
+   i == 3 and the high bit is set, `value` promotes to int and the
+   shift overflows int range. Fixed by casting to dmc_unrar_size_t
+   before the shift.
+
+2. Abort at dmc_unrar.c:8004 (dmc_unrar_rar50_decompress):
+   `current_offset == filters_get_first_offset()` assert fires when
+   a malformed archive declares a filter at an offset the decoder
+   has already advanced past. Fixed by turning the assert into a
+   runtime check that returns DMC_UNRAR_INVALID_DATA. The symmetric
+   assert at dmc_unrar.c:7154 in the rar30 decoder got the same
+   guard.
+
+Surfaced on the second 10-minute post-Phase-6 fuzz_extract_mem run
+(resumed from the prior corpus after the filter-underrun fix).

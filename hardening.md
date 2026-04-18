@@ -27,16 +27,25 @@ landed. Completed:
   minimization script, and a regression hook in `runner.c`. Fuzzing
   is out-of-band (local only, not in CI); fuzz-found bug fixtures
   live under `test/fixtures/fuzz/`.
-- Phase 7 findings (seven bugs fixed so far): RAR5 header-parse hang,
+- Phase 7 findings (nine bugs fixed so far, the most recent an ASan
+  heap-OOB-read in `dmc_unrar_filters_x86_filter` caused by
+  `i <= length - 5` underflowing on length-4 inputs; all four x86
+  filter callers had a too-loose `< 4` guard, now `< 5`, plus
+  internal belt-and-braces guards in both the x86 and ARM filters):
+  RAR5 header-parse hang,
   RAR5 metadata-walker hang, LZSS out-of-window back-reference
   assert, unbounded LZSS dictionary allocation (up to 4 GiB driven
   by a RAR5 header field), zero-width / uninitialized Huffman
   decode path that drove an assert in `dmc_unrar_bs_peek_uint32`,
   a zero-length RAR5 filter that drove an assert in
-  `dmc_unrar_rar50_decompress`, and a short-fill filter-input slot
-  where the RAR5 block decoder returned OK with an underrun (same
-  pre-existing assert pattern in the rar30 path got the same
-  guard). All seven fixtures run under ASan in
+  `dmc_unrar_rar50_decompress`, a short-fill filter-input slot
+  where the RAR5 block decoder returned OK with an underrun, and a
+  pair surfaced by the same 152-byte input — a signed-int shift UB
+  in `dmc_unrar_rar50_read_block_header` (uint8_t promoted to int
+  before a 24-bit left shift) and a current-offset-beyond-filter
+  assert in `dmc_unrar_rar50_decompress`. The latter three
+  filter-path asserts got the same runtime-check treatment in the
+  symmetric rar30 path. All eight fixtures run under ASan in
   `test_fuzz_regressions`.
 - Phase 6 caps: alongside `DMC_UNRAR_MAX_DICT_SIZE` (LZSS window,
   default 256 MiB), the library now enforces

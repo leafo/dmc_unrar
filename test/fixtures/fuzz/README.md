@@ -41,14 +41,19 @@ prefix of a content hash so different crashes don't collide.
 | `fuzz_extract_mem_73a7f1b48a_bspeek.rar` | Huffman decode on an uninitialized / zero-width table, 335 bytes. |
 | `fuzz_extract_mem_34d0acd798_filter0.rar` | RAR5 zero-length filter assert in `dmc_unrar_rar50_decompress`, 195 bytes. |
 | `fuzz_extract_mem_3e8c033a03_filterunderrun.rar` | RAR5 short-fill from `rar50_decompress_block` into a filter input slot (`filter_offset != filter_length` at dmc_unrar.c:8014), 161 bytes. |
+| `fuzz_extract_mem_a30f3c5c86_filteroffset.rar` | RAR5 block-size shift UBSan (`uint8_t << 24` at dmc_unrar.c:8152) + filter-offset assert (decoder advanced past the archive's declared filter position, dmc_unrar.c:8004), 152 bytes. |
+| `fuzz_extract_mem_bbd9d9a307_x86filter.rar` | Heap OOB read in `dmc_unrar_filters_x86_filter` (`i <= length - 5` unsigned-underflow when length < 5; caller guards said `< 4` but the loop reads 5 bytes per window), 205 bytes. |
 
 First three surfaced on the initial 30-second smoke runs; the OOM was
 found on the first post-fix 60-second smoke run, followed by the
 zero-width Huffman table crash on the next extract smoke run. The
 zero-length filter crash surfaced on the 60-second smoke run taken
 right after the Phase 6 caps landed. The filter-underrun crash
-surfaced on the first 10-minute post-Phase-6 smoke run. All seven now
-return cleanly and run under ASan in `test_fuzz_regressions`.
+surfaced on the first 10-minute post-Phase-6 smoke run; the
+block-size-shift + filter-offset pair surfaced on the second; the
+x86-filter OOB surfaced on the third (20-minute focused extract-only
+run). All nine now return cleanly and run under ASan in
+`test_fuzz_regressions`.
 
 ## Awaiting fix
 

@@ -461,6 +461,8 @@ static const struct {
 	{ "fuzz_extract_mem",   "test/fixtures/fuzz/fuzz_extract_mem_73a7f1b48a_bspeek.rar" },
 	{ "fuzz_extract_mem",   "test/fixtures/fuzz/fuzz_extract_mem_34d0acd798_filter0.rar" },
 	{ "fuzz_extract_mem",   "test/fixtures/fuzz/fuzz_extract_mem_3e8c033a03_filterunderrun.rar" },
+	{ "fuzz_extract_mem",   "test/fixtures/fuzz/fuzz_extract_mem_a30f3c5c86_filteroffset.rar" },
+	{ "fuzz_extract_mem",   "test/fixtures/fuzz/fuzz_extract_mem_bbd9d9a307_x86filter.rar" },
 	{ NULL, NULL }
 };
 

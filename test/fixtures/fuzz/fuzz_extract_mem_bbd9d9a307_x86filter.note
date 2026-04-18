@@ -1,0 +1,12 @@
+fuzz_extract_mem: 1-byte heap OOB read inside dmc_unrar_filters_x86_filter
+(dmc_unrar.c:11867). The loop header `i <= length - 5` underflows when
+length < 5, walking i past the allocated filter-memory buffer and
+reading the trailing byte. Callers (RAR3 and RAR5 x86/x86_e9 filter
+funcs) guarded `in_length < 4` but the filter actually reads 5 bytes
+per window (memory[i..i+4]), so length == 4 slipped past. Fixed by
+tightening the four caller guards to `< 5`, adding a belt-and-braces
+internal guard inside the x86 filter, and giving the ARM filter the
+same internal guard (its loop reads 4 bytes per window and had the
+same class of unsigned-underflow bug if anyone changed the caller).
+205-byte minimized input, surfaced on the 20-minute post-Phase-6
+fuzz_extract_mem run.

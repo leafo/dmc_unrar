@@ -7147,11 +7147,15 @@ static dmc_unrar_return dmc_unrar_rar30_decompress(dmc_unrar_rar30_context *ctx)
 			continue;
 		}
 
-		/* Now we should have filters and be at the first filter position. */
+		/* Now we should have filters and be at the first filter position.
+		   A malformed archive can point a filter at an offset behind the
+		   current decode position; treat that as invalid data rather than
+		   hitting the assert. */
 
 		DMC_UNRAR_ASSERT(!dmc_unrar_filters_empty(&ctx->filters));
 		DMC_UNRAR_ASSERT(dmc_unrar_filters_get_first_length(&ctx->filters) > 0);
-		DMC_UNRAR_ASSERT(current_offset == dmc_unrar_filters_get_first_offset(&ctx->filters));
+		if (current_offset != dmc_unrar_filters_get_first_offset(&ctx->filters))
+			return DMC_UNRAR_INVALID_DATA;
 
 		/* Decode into the filter memory. */
 
@@ -7997,11 +8001,13 @@ static dmc_unrar_return dmc_unrar_rar50_decompress(dmc_unrar_rar50_context *ctx)
 			continue;
 		}
 
-		/* Now we should have filters and be at the first filter position. */
+		/* Now we should have filters and be at the first filter position.
+		   Symmetric guard to the rar30 path above. */
 
 		DMC_UNRAR_ASSERT(!dmc_unrar_filters_empty(&ctx->filters));
 		DMC_UNRAR_ASSERT(dmc_unrar_filters_get_first_length(&ctx->filters) > 0);
-		DMC_UNRAR_ASSERT(current_offset == dmc_unrar_filters_get_first_offset(&ctx->filters));
+		if (current_offset != dmc_unrar_filters_get_first_offset(&ctx->filters))
+			return DMC_UNRAR_INVALID_DATA;
 
 		/* Decode into the filter memory. */
 
@@ -8149,7 +8155,11 @@ static dmc_unrar_return dmc_unrar_rar50_read_block_header(dmc_unrar_rar50_contex
 		for (i = 0; i < size_count; i++) {
 			const uint8_t value = dmc_unrar_bs_read_bits(&ctx->ctx->bs, 8);
 
-			block_size += value << (i * 8);
+			/* Cast to dmc_unrar_size_t before shifting: plain `value << 24`
+			   would promote to int and overflow when the high bit is set,
+			   which UBSan flags. size_count maxes at 4, so the shift count
+			   stays inside 0..24 either way. */
+			block_size += (dmc_unrar_size_t)value << (i * 8);
 
 			calculated_checksum ^= value;
 		}
@@ -11853,6 +11863,13 @@ static void dmc_unrar_filters_x86_filter(uint8_t *memory, dmc_unrar_size_t lengt
 	const int32_t file_size = 0x1000000;
 	dmc_unrar_size_t i;
 
+	/* The loop below reads memory[i..i+4]; guard against an unsigned
+	   underflow in `length - 5` when length is too small. Callers are
+	   supposed to reject short filter inputs, but belt-and-braces here
+	   makes the primitive safe on its own. */
+	if (length < 5)
+		return;
+
 	for (i = 0; i <= length - 5; i++) {
 		if ((memory[i] == 0xE8) || (handle_e9 && (memory[i] == 0xE9))) {
 			int32_t cur_pos = file_pos + i + 1, address;
@@ -11878,7 +11895,9 @@ static dmc_unrar_return dmc_unrar_filters_30_x86_func(uint8_t *memory, dmc_unrar
 		dmc_unrar_size_t file_position, dmc_unrar_size_t in_length, const uint32_t *registers,
 		dmc_unrar_size_t *out_offset, dmc_unrar_size_t *out_length) {
 
-	if ((in_length > memory_size) || (in_length < 4))
+	/* The x86 filter reads 5 bytes per window (memory[i..i+4]), so we
+	   need at least 5 bytes of input to run it safely. */
+	if ((in_length > memory_size) || (in_length < 5))
 		return DMC_UNRAR_FILTERS_INVALID_LENGTH;
 	if (file_position >= 0x7FFFFFFF)
 		return DMC_UNRAR_FILTERS_INVALID_FILE_POSITION;
@@ -11896,7 +11915,9 @@ static dmc_unrar_return dmc_unrar_filters_30_x86_e9_func(uint8_t *memory, dmc_un
 		dmc_unrar_size_t file_position, dmc_unrar_size_t in_length, const uint32_t *registers,
 		dmc_unrar_size_t *out_offset, dmc_unrar_size_t *out_length) {
 
-	if ((in_length > memory_size) || (in_length < 4))
+	/* The x86 filter reads 5 bytes per window (memory[i..i+4]), so we
+	   need at least 5 bytes of input to run it safely. */
+	if ((in_length > memory_size) || (in_length < 5))
 		return DMC_UNRAR_FILTERS_INVALID_LENGTH;
 	if (file_position >= 0x7FFFFFFF)
 		return DMC_UNRAR_FILTERS_INVALID_FILE_POSITION;
@@ -12088,7 +12109,9 @@ static dmc_unrar_return dmc_unrar_filters_50_x86_func(uint8_t *memory, dmc_unrar
 	dmc_unrar_size_t file_position, dmc_unrar_size_t in_length, const uint32_t *registers,
 	dmc_unrar_size_t *out_offset, dmc_unrar_size_t *out_length) {
 
-	if ((in_length > memory_size) || (in_length < 4))
+	/* The x86 filter reads 5 bytes per window (memory[i..i+4]), so we
+	   need at least 5 bytes of input to run it safely. */
+	if ((in_length > memory_size) || (in_length < 5))
 		return DMC_UNRAR_FILTERS_INVALID_LENGTH;
 	if (file_position >= 0x7FFFFFFF)
 		return DMC_UNRAR_FILTERS_INVALID_FILE_POSITION;
@@ -12106,7 +12129,9 @@ static dmc_unrar_return dmc_unrar_filters_50_x86_e9_func(uint8_t *memory, dmc_un
 	dmc_unrar_size_t file_position, dmc_unrar_size_t in_length, const uint32_t *registers,
 	dmc_unrar_size_t *out_offset, dmc_unrar_size_t *out_length) {
 
-	if ((in_length > memory_size) || (in_length < 4))
+	/* The x86 filter reads 5 bytes per window (memory[i..i+4]), so we
+	   need at least 5 bytes of input to run it safely. */
+	if ((in_length > memory_size) || (in_length < 5))
 		return DMC_UNRAR_FILTERS_INVALID_LENGTH;
 	if (file_position >= 0x7FFFFFFF)
 		return DMC_UNRAR_FILTERS_INVALID_FILE_POSITION;
@@ -12122,6 +12147,11 @@ static dmc_unrar_return dmc_unrar_filters_50_x86_e9_func(uint8_t *memory, dmc_un
 
 static void dmc_unrar_filters_50_arm_filter(uint8_t *memory, dmc_unrar_size_t length, int32_t file_pos) {
 	dmc_unrar_size_t i;
+
+	/* Guard the same unsigned-underflow class as the x86 filter; the
+	   loop reads memory[i..i+3] so we need at least 4 bytes. */
+	if (length < 4)
+		return;
 
 	for (i = 0; i <= length - 4; i += 4) {
 		if (memory[i + 3] == 0xEB) {
@@ -12140,6 +12170,7 @@ static dmc_unrar_return dmc_unrar_filters_50_arm_func(uint8_t *memory, dmc_unrar
 	dmc_unrar_size_t file_position, dmc_unrar_size_t in_length, const uint32_t *registers,
 	dmc_unrar_size_t *out_offset, dmc_unrar_size_t *out_length) {
 
+	/* The ARM filter reads 4 bytes per window (memory[i..i+3]). */
 	if ((in_length > memory_size) || (in_length < 4))
 		return DMC_UNRAR_FILTERS_INVALID_LENGTH;
 	if (file_position >= 0x7FFFFFFF)
