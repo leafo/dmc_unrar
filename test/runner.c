@@ -249,6 +249,50 @@ static int test_solid_rar5_out_of_order_extract(void) {
 	return 0;
 }
 
+static int test_solid_rar5_cached_input_offsets(void) {
+	dmc_unrar_archive a;
+	dmc_unrar_size_t i;
+	dmc_unrar_file_block *prev = NULL;
+	dmc_unrar_size_t expected = 0;
+	static const char *names[] = {
+		"file1.txt",
+		"file2.txt",
+		"file3.txt",
+		"file4.txt",
+		"file5.txt"
+	};
+
+	T_ASSERT_RET(dmc_unrar_archive_init(&a), DMC_UNRAR_OK);
+	T_ASSERT_RET(dmc_unrar_archive_open_path(&a, CORPUS("solid.rar")), DMC_UNRAR_OK);
+
+	for (i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+		dmc_unrar_size_t idx = find_file_by_name(&a, names[i]);
+		dmc_unrar_file_block *file;
+
+		T_ASSERT(idx != (dmc_unrar_size_t)-1);
+		file = &a.internal_state->files[idx];
+
+		if (i == 0) {
+			T_ASSERT(file->solid_start == file);
+			T_ASSERT(file->solid_prev == NULL);
+		} else {
+			T_ASSERT(file->solid_start == prev->solid_start);
+			T_ASSERT(file->solid_prev == prev);
+			T_ASSERT(prev->solid_next == file);
+		}
+
+		T_ASSERT_EQ(file->solid_input_start_bits, expected);
+
+		if (file->file.compressed_size > (uint64_t)(DMC_UNRAR_SIZE_MAX / 8))
+			T_FAIL("fixture compressed size is too large for packed-bit test");
+		expected += (dmc_unrar_size_t)file->file.compressed_size * 8;
+		prev = file;
+	}
+
+	dmc_unrar_archive_close(&a);
+	return 0;
+}
+
 /* Regression test for B.1: extract_to_heap on a CRC-failing archive must
  * not double-free or leak. Pre-fix: the failure path frees the caller's
  * `void **buffer` handle (an invalid free). ASan catches that. */
@@ -689,6 +733,7 @@ static const test_entry tests[] = {
 	{ "extract_to_heap_ok",           test_extract_to_heap_ok },
 	{ "solid_rar5_sequential_extract", test_solid_rar5_sequential_extract },
 	{ "solid_rar5_out_of_order_extract", test_solid_rar5_out_of_order_extract },
+	{ "solid_rar5_cached_input_offsets", test_solid_rar5_cached_input_offsets },
 	{ "extract_to_heap_corrupt_crc",  test_extract_to_heap_corrupt_crc },
 	{ "encrypted_header_detected",    test_encrypted_header_detected },
 	{ "encrypted_data_unsupported",   test_encrypted_data_unsupported },
