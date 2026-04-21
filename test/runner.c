@@ -325,6 +325,109 @@ static int test_callback_null_buffer(void) {
 	return 0;
 }
 
+/* Cancel callback that always reports cancel on the first call. */
+static bool cancel_always(void *opaque) {
+	int *calls = (int *)opaque;
+	(*calls)++;
+	return false; /* stop */
+}
+
+typedef struct cancel_after_output_tag {
+	cb_state *state;
+	int calls;
+} cancel_after_output;
+
+/* Cancel once the extraction callback has received at least one chunk. */
+static bool cancel_after_output_seen(void *opaque) {
+	cancel_after_output *cancel = (cancel_after_output *)opaque;
+	cancel->calls++;
+	return cancel->state->total == 0;
+}
+
+/* Verifies that dmc_unrar_archive_open_path() unwinds with
+ * DMC_UNRAR_USER_CANCEL when the caller's cancel callback returns false
+ * during the block-collect walk. */
+static int test_cancel_at_open(void) {
+	dmc_unrar_archive a;
+	int calls = 0;
+	dmc_unrar_return rc;
+
+	T_ASSERT_RET(dmc_unrar_archive_init(&a), DMC_UNRAR_OK);
+	a.cancel.func = cancel_always;
+	a.cancel.opaque = &calls;
+
+	rc = dmc_unrar_archive_open_path(&a, CORPUS("simple.rar"));
+	T_ASSERT_RET(rc, DMC_UNRAR_USER_CANCEL);
+	T_ASSERT(calls > 0);
+
+	dmc_unrar_archive_close(&a);
+	return 0;
+}
+
+/* Verifies that dmc_unrar_extract_file_with_callback() unwinds with
+ * DMC_UNRAR_USER_CANCEL when the caller's cancel callback returns false
+ * after some data has been emitted. Opens the archive without cancellation,
+ * then wires the callback and extracts with a small buffer so the driver
+ * iterates several times. */
+static int test_cancel_at_extract(void) {
+	dmc_unrar_archive a;
+	dmc_unrar_size_t idx;
+	cb_state s;
+	cancel_after_output cancel;
+	dmc_unrar_return rc;
+	s.total = 0;
+	s.saw_nonnull_buffer = false;
+	cancel.state = &s;
+	cancel.calls = 0;
+
+	T_ASSERT_RET(dmc_unrar_archive_init(&a), DMC_UNRAR_OK);
+	T_ASSERT_RET(dmc_unrar_archive_open_path(&a, CORPUS("simple.rar")), DMC_UNRAR_OK);
+	idx = find_file_by_name(&a, "hello.txt");
+	T_ASSERT(idx != (dmc_unrar_size_t)-1);
+
+	a.cancel.func = cancel_after_output_seen;
+	a.cancel.opaque = &cancel;
+
+	rc = dmc_unrar_extract_file_with_callback(&a, idx, NULL, 4, NULL,
+	                                          false, &s, cb_collect);
+	T_ASSERT_RET(rc, DMC_UNRAR_USER_CANCEL);
+	T_ASSERT(s.total > 0);
+	T_ASSERT(cancel.calls > 0);
+
+	dmc_unrar_archive_close(&a);
+	return 0;
+}
+
+/* Verifies that cancellation is observed before unpacking skipped solid
+ * predecessors. That path bypasses the normal output-chunk callback until
+ * the requested later file is reached. */
+static int test_cancel_at_solid_skip(void) {
+	dmc_unrar_archive a;
+	dmc_unrar_size_t idx;
+	int calls = 0;
+	cb_state s;
+	dmc_unrar_return rc;
+	s.total = 0;
+	s.saw_nonnull_buffer = false;
+
+	T_ASSERT_RET(dmc_unrar_archive_init(&a), DMC_UNRAR_OK);
+	T_ASSERT_RET(dmc_unrar_archive_open_path(&a, CORPUS("solid.rar")), DMC_UNRAR_OK);
+	idx = find_file_by_name(&a, "file5.txt");
+	T_ASSERT(idx != (dmc_unrar_size_t)-1);
+
+	a.cancel.func = cancel_always;
+	a.cancel.opaque = &calls;
+
+	rc = dmc_unrar_extract_file_with_callback(&a, idx, NULL, 4, NULL,
+	                                          false, &s, cb_collect);
+	T_ASSERT_RET(rc, DMC_UNRAR_USER_CANCEL);
+	T_ASSERT(calls > 0);
+	T_ASSERT(s.total == 0);
+
+	dmc_unrar_archive_close(&a);
+	return 0;
+}
+
 /* Phase D.1: filename_is_safe() helper behavior.
  *
  * These exercise the internal helper directly (it's static; because we
@@ -530,6 +633,9 @@ static const test_entry tests[] = {
 	{ "symlink_unsupported",          test_symlink_unsupported },
 	{ "truncated_does_not_crash",     test_truncated_does_not_crash },
 	{ "callback_null_buffer",         test_callback_null_buffer },
+	{ "cancel_at_open",                test_cancel_at_open },
+	{ "cancel_at_extract",             test_cancel_at_extract },
+	{ "cancel_at_solid_skip",          test_cancel_at_solid_skip },
 	{ "path_extract_no_partial_on_fail", test_path_extract_no_partial_on_fail },
 	{ "filename_is_safe_helper",      test_filename_is_safe_helper },
 	{ "extract_to_path_safe_default", test_extract_to_path_safe_default },

@@ -63,8 +63,18 @@ landed. Completed:
   fires when the decompressor reads the per-block heap hint. Ratio
   check uses overflow-checked multiplication, not floor division,
   so values just above the cap can't sneak through.
-  Callback-driven cancellation and a list-only mode are still
-  outstanding.
+  A cooperative cancel callback (`dmc_unrar_cancel` on the archive
+  struct) is also in place: the library polls it at the top of the
+  RAR4/RAR5 block-collect loops, inside the extract driver, around
+  skipped solid predecessors / solid tail draining, and in the main
+  decompressor loops. A `false` return unwinds with
+  `DMC_UNRAR_USER_CANCEL`. This gives callers an app-level timeout /
+  user-cancel hook without requiring the library to force-stop a
+  runaway read or user callback. Cancellation is cooperative: it is
+  observed at library poll points and cannot interrupt an IO callback
+  or extraction callback that is already running.
+  A list-only mode that avoids allocating decompressor state is
+  still outstanding.
 - Phase 5 subset: `dmc_unrar_extract_file_to_path()` now rejects unsafe
   archive filenames (traversal, absolute, UNC, drive prefix) by default
   and returns `DMC_UNRAR_FILE_UNSAFE_PATH`. Path extraction is also
@@ -83,10 +93,10 @@ Still outstanding (tracked below):
   extraction after the first file.
 - Phase 5 tail: UTF-8 enforcement in the safety check, Windows-reserved-
   name rejection, opt-in overwrite protection.
-- Phase 6 tail: callback-driven cancellation / timeout mechanism, and
-  a list-only mode that avoids allocating decompressor state. The
-  archive-bomb caps (file count, per-file size, total size,
-  compression ratio, PPMd heap) all landed in this round.
+- Phase 6 tail: a list-only mode that avoids allocating decompressor
+  state. The archive-bomb caps (file count, per-file size, total
+  size, compression ratio, PPMd heap) and the cooperative cancel
+  callback all landed in previous rounds.
 - Phase 7 tail: add a fork/timeout isolation layer to `runner.c` so
   hang/crash-class fixtures can land in the regression table pre-fix,
   extend fuzzing beyond 60-second smoke runs once the Phase-6 caps
@@ -287,8 +297,12 @@ Acceptance criteria:
 - [x] Add a configurable maximum PPMd memory size.
       (`DMC_UNRAR_MAX_PPMD_SIZE_MB`, default 32 MiB, only enforced
       when the archive explicitly declares a heap size.)
-- [ ] Add callback-driven cancellation or another app-controlled timeout
-      mechanism.
+- [x] Add callback-driven cancellation or another app-controlled timeout
+      mechanism. (`dmc_unrar_cancel` on the archive struct; polled at
+      the top of the RAR4/RAR5 block-collect loops, inside the extract
+      driver, around skipped solid predecessors / solid tail draining,
+      and in the main decompressor loops; returning `false` unwinds
+      with `DMC_UNRAR_USER_CANCEL`.)
 - [ ] Add a list-only mode that avoids allocating decompressor state.
 
 Acceptance criteria:

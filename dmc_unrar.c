@@ -591,7 +591,9 @@ typedef enum {
 	DMC_UNRAR_50_DISABLED_FEATURE_FILTERS,
 
 	DMC_UNRAR_50_INVALID_LENGTH_TABLE_DATA,
-	DMC_UNRAR_50_BLOCK_CHECKSUM_NO_MATCH
+	DMC_UNRAR_50_BLOCK_CHECKSUM_NO_MATCH,
+
+	DMC_UNRAR_USER_CANCEL
 
 } dmc_unrar_return;
 
@@ -730,6 +732,26 @@ typedef struct dmc_unrar_io_tag {
 
 } dmc_unrar_io;
 
+/** Cancellation callback. Called periodically inside long-running library
+ *  operations (archive open/list, file extract and decompressor loops).
+ *  Return true to continue, false to request cancellation; the enclosing
+ *  library call will unwind with DMC_UNRAR_USER_CANCEL.
+ *
+ *  Cancellation is cooperative and is only observed at library poll points.
+ *  It cannot interrupt a blocking IO callback or user extraction callback
+ *  that is already running. May be called many times per second; keep the
+ *  callback cheap and do not call back into the same archive from it.
+ *  Callers that want a wall-clock timeout can check the clock inside the
+ *  callback and return false once it elapses. If another thread updates
+ *  the state read through opaque, the caller must provide synchronization
+ *  appropriate for that state. */
+typedef bool (*dmc_unrar_cancel_func)(void *opaque);
+
+typedef struct dmc_unrar_cancel_tag {
+	dmc_unrar_cancel_func func; /**< NULL disables cancellation. */
+	void *opaque;               /**< Private data passed to func. */
+} dmc_unrar_cancel;
+
 /** A RAR archive. */
 typedef struct dmc_unrar_archive_tag {
 	dmc_unrar_alloc alloc;
@@ -737,6 +759,11 @@ typedef struct dmc_unrar_archive_tag {
 
 	/** Private internal state. */
 	dmc_unrar_internal_state *internal_state;
+
+	/** Optional cooperative cancellation callback. May be set before opening
+	 *  an archive and may be changed between library calls, for example after
+	 *  open and before extraction. */
+	dmc_unrar_cancel cancel;
 
 } dmc_unrar_archive;
 
@@ -795,34 +822,36 @@ dmc_unrar_return dmc_unrar_archive_init(dmc_unrar_archive *archive);
 
 /** Open this RAR archive, reading its block and file headers.
  *  The io field must be initialized.
- *  The func_alloc, func_realloc, func_free and opaque_mem fields may be set.
- *  All other fields must have been cleared.
+ *  The func_alloc, func_realloc, func_free, opaque_mem and cancel fields
+ *  may be set. All other fields must have been cleared.
  *
  *  @param  archive Pointer to the archive structure to use. Needs to be a valid
  *                  pointer, with the fields properly initialized and set.
  *  @return DMC_UNRAR_OK if the archive was successfully opened. Any other value
- *          describes an error condition.
+ *          describes an error condition. If archive->cancel.func returns false
+ *          while headers are being read, DMC_UNRAR_USER_CANCEL is returned.
  */
 dmc_unrar_return dmc_unrar_archive_open(dmc_unrar_archive *archive);
 
 /** Open this RAR archive from a memory block, reading its block and file headers.
- *  The func_alloc, func_realloc, func_free and opaque_mem fields may be set.
- *  All other fields must have been cleared.
+ *  The func_alloc, func_realloc, func_free, opaque_mem and cancel fields
+ *  may be set. All other fields must have been cleared.
  *
  *  @param  archive Pointer to the archive structure to use. Needs to be a valid
  *                  pointer, with the fields properly initialized and set.
  *  @param  mem Pointer to a block of memory to read the RAR file out of.
  *  @param  size Size of the RAR memory region.
  *  @return DMC_UNRAR_OK if the archive was successfully opened. Any other value
- *          describes an error condition.
+ *          describes an error condition. If archive->cancel.func returns false
+ *          while headers are being read, DMC_UNRAR_USER_CANCEL is returned.
  */
 dmc_unrar_return dmc_unrar_archive_open_mem(dmc_unrar_archive *archive,
 	const void *mem, dmc_unrar_size_t size);
 
 #if DMC_UNRAR_DISABLE_STDIO != 1
 /** Open this RAR archive from a stdio FILE, reading its block and file headers.
- *  The func_alloc, func_realloc, func_free and opaque_mem fields may be set.
- *  All other fields must have been cleared.
+ *  The func_alloc, func_realloc, func_free, opaque_mem and cancel fields
+ *  may be set. All other fields must have been cleared.
  *
  *  The stdio FILE will be taken over and will be closed when the archive is
  *  closed with dmc_unrar_archive_close().
@@ -831,14 +860,15 @@ dmc_unrar_return dmc_unrar_archive_open_mem(dmc_unrar_archive *archive,
  *                  pointer, with the fields properly initialized and set.
  *  @param  file The stdio FILE structure to read out of.
  *  @return DMC_UNRAR_OK if the archive was successfully opened. Any other value
- *          describes an error condition.
+ *          describes an error condition. If archive->cancel.func returns false
+ *          while headers are being read, DMC_UNRAR_USER_CANCEL is returned.
  */
 dmc_unrar_return dmc_unrar_archive_open_file(dmc_unrar_archive *archive, FILE *file);
 #endif /* DMC_UNRAR_DISABLE_STDIO */
 
 /** Open this RAR archive from a path, opening the file with dmc_unrar_io_default_handler,
- *  and reading its block and file headers. The func_alloc, func_realloc, func_free and
- *  opaque_mem fields may be set. All other fields must have been cleared.
+ *  and reading its block and file headers. The func_alloc, func_realloc, func_free,
+ *  opaque_mem and cancel fields may be set. All other fields must have been cleared.
  *
  *  Please note that on Windows, full UTF-8 paths only work when using the WIN32 API
  *  (see DMC_UNRAR_DISABLE_WIN32 above). Without the WIN32 API, only plain ASCII paths
@@ -849,13 +879,15 @@ dmc_unrar_return dmc_unrar_archive_open_file(dmc_unrar_archive *archive, FILE *f
  *  @param  path The path of the file to dmc_unrar_io_default_handler and read out of.
  *               This must be UTF-8.
  *  @return DMC_UNRAR_OK if the archive was successfully opened. Any other value
- *          describes an error condition.
+ *          describes an error condition. If archive->cancel.func returns false
+ *          while headers are being read, DMC_UNRAR_USER_CANCEL is returned.
  */
 dmc_unrar_return dmc_unrar_archive_open_path(dmc_unrar_archive *archive, const char *path);
 
 /** Close this RAR archive again.
  *
- *  All allocated memory will be freed. */
+ *  All allocated memory will be freed, and the archive structure including
+ *  the cancel callback will be cleared. */
 void dmc_unrar_archive_close(dmc_unrar_archive *archive);
 
 /** Get the global archive comment of a RAR archive.
@@ -930,6 +962,12 @@ dmc_unrar_return dmc_unrar_file_is_supported(dmc_unrar_archive *archive, dmc_unr
  */
 dmc_unrar_size_t dmc_unrar_get_file_comment(dmc_unrar_archive *archive, dmc_unrar_size_t index,
 	void *comment, dmc_unrar_size_t comment_size);
+
+/** Cancellation: all extraction functions poll archive->cancel during
+ *  long-running work. If archive->cancel.func returns false, extraction
+ *  unwinds with DMC_UNRAR_USER_CANCEL. The callback may be changed between
+ *  library calls, including after opening the archive and before starting
+ *  extraction. */
 
 /** Extract a file entry into a pre-allocated memory buffer.
  *
@@ -1324,6 +1362,9 @@ const char *dmc_unrar_strerror(dmc_unrar_return code) {
 
 		case DMC_UNRAR_50_BLOCK_CHECKSUM_NO_MATCH:
 			return "RAR 5.0 block checksum doesn't match";
+
+		case DMC_UNRAR_USER_CANCEL:
+			return "Operation cancelled by user callback";
 
 		default:
 			break;
@@ -2669,6 +2710,15 @@ static bool dmc_unrar_u64_mul_ok(uint64_t a, uint64_t b, uint64_t *out) {
 	return true;
 }
 
+/* Poll the archive's cancel callback. Returns DMC_UNRAR_USER_CANCEL if the
+   caller asked us to stop, DMC_UNRAR_OK otherwise (including when no callback
+   is registered). Called at the top of long-running library loops. */
+static dmc_unrar_return dmc_unrar_cancel_check(dmc_unrar_archive *archive) {
+	if (archive->cancel.func && !archive->cancel.func(archive->cancel.opaque))
+		return DMC_UNRAR_USER_CANCEL;
+	return DMC_UNRAR_OK;
+}
+
 /* Compute `block->start_pos + block->header_size + block->data_size` with
    overflow and end-of-stream checks. Returns false on overflow or when the
    end of the block would lie past the end of the archive stream. Used
@@ -2780,6 +2830,10 @@ static dmc_unrar_return dmc_unrar_rar4_collect_blocks(dmc_unrar_archive *archive
 	state->archive_flags = 0;
 
 	while (dmc_unrar_io_tell(&archive->io) < (dmc_unrar_offset_t)archive->io.size) {
+		const dmc_unrar_return cancelled = dmc_unrar_cancel_check(archive);
+		if (cancelled != DMC_UNRAR_OK)
+			return cancelled;
+
 		/* One more block. */
 		if (!dmc_unrar_grow_blocks(archive))
 			return DMC_UNRAR_ALLOC_FAIL;
@@ -3254,6 +3308,10 @@ static dmc_unrar_return dmc_unrar_rar5_collect_blocks(dmc_unrar_archive *archive
 	dmc_unrar_internal_state *state = archive->internal_state;
 
 	while (dmc_unrar_io_tell(&archive->io) < (dmc_unrar_offset_t)archive->io.size) {
+		const dmc_unrar_return cancelled = dmc_unrar_cancel_check(archive);
+		if (cancelled != DMC_UNRAR_OK)
+			return cancelled;
+
 		/* One more block. */
 		if (!dmc_unrar_grow_blocks(archive))
 			return DMC_UNRAR_ALLOC_FAIL;
@@ -5019,6 +5077,10 @@ static dmc_unrar_return dmc_unrar_file_extract_with_callback_and_extractor(dmc_u
 		void *old_buffer;
 		dmc_unrar_size_t old_buffer_size, read_size;
 
+		return_code = dmc_unrar_cancel_check(archive);
+		if (return_code != DMC_UNRAR_OK)
+			break;
+
 		if (!buffer) {
 			buffer_allocated = true;
 
@@ -5588,6 +5650,10 @@ static dmc_unrar_return dmc_unrar_rar_context_unpack(dmc_unrar_rar_context *ctx,
 		while (part && (part != file)) {
 			const dmc_unrar_size_t part_size = ctx->has_end_marker ? DMC_UNRAR_SIZE_MAX : part->file.uncompressed_size;
 
+			return_code = dmc_unrar_cancel_check(archive);
+			if (return_code != DMC_UNRAR_OK)
+				goto fail;
+
 			if (!dmc_unrar_rar_context_file_match(ctx, part, file))
 				goto broken;
 
@@ -5596,6 +5662,10 @@ static dmc_unrar_return dmc_unrar_rar_context_unpack(dmc_unrar_rar_context *ctx,
 				goto fail;
 
 			if ((return_code = ctx->unpack(ctx)) != DMC_UNRAR_OK)
+				goto fail;
+
+			return_code = dmc_unrar_cancel_check(archive);
+			if (return_code != DMC_UNRAR_OK)
 				goto fail;
 
 			part = part->solid_next;
@@ -5636,6 +5706,10 @@ static dmc_unrar_return dmc_unrar_rar_context_unpack(dmc_unrar_rar_context *ctx,
 	if (ctx->file->solid_next) {
 
 		if (ctx->has_end_marker) {
+			return_code = dmc_unrar_cancel_check(archive);
+			if (return_code != DMC_UNRAR_OK)
+				goto fail;
+
 			ctx->buffer      = NULL;
 			ctx->buffer_size = DMC_UNRAR_SIZE_MAX;
 
@@ -6045,6 +6119,10 @@ static dmc_unrar_return dmc_unrar_rar15_decompress(dmc_unrar_rar15_context *ctx)
 	}
 
 	while (ctx->ctx->buffer_offset < ctx->ctx->buffer_size) {
+		return_code = dmc_unrar_cancel_check(ctx->ctx->archive);
+		if (return_code != DMC_UNRAR_OK)
+			return return_code;
+
 		/* A previous symbol produced an out-of-window back-reference.
 		   Fail the decompress cleanly instead of producing garbage. */
 		if (ctx->ctx->lzss.error)
@@ -6612,6 +6690,10 @@ static dmc_unrar_return dmc_unrar_rar20_decompress(dmc_unrar_rar20_context *ctx)
 		uint32_t symbol;
 		dmc_unrar_size_t offset, length;
 
+		return_code = dmc_unrar_cancel_check(ctx->ctx->archive);
+		if (return_code != DMC_UNRAR_OK)
+			return return_code;
+
 		if (ctx->ctx->lzss.error)
 			return DMC_UNRAR_INVALID_DATA;
 
@@ -7091,6 +7173,10 @@ static dmc_unrar_return dmc_unrar_rar30_decompress(dmc_unrar_rar30_context *ctx)
 	while (ctx->ctx->buffer_offset < ctx->ctx->buffer_size) {
 		const dmc_unrar_size_t current_offset = ctx->ctx->current_file_start + ctx->ctx->solid_offset + ctx->ctx->buffer_offset;
 
+		return_code = dmc_unrar_cancel_check(ctx->ctx->archive);
+		if (return_code != DMC_UNRAR_OK)
+			return return_code;
+
 		if (ctx->filter_overhang > 0) {
 			/* We still have filter output that goes to the decompression output buffer. */
 
@@ -7221,6 +7307,10 @@ static dmc_unrar_return dmc_unrar_rar30_decompress_block(dmc_unrar_rar30_context
 	(void)stop_at_filter;
 
 	while (*buffer_offset < buffer_size) {
+		return_code = dmc_unrar_cancel_check(ctx->ctx->archive);
+		if (return_code != DMC_UNRAR_OK)
+			return return_code;
+
 		if (ctx->ctx->lzss.error)
 			return DMC_UNRAR_INVALID_DATA;
 
@@ -7934,6 +8024,10 @@ static dmc_unrar_return dmc_unrar_rar50_decompress(dmc_unrar_rar50_context *ctx)
 	DMC_UNRAR_ASSERT(ctx);
 
 	while ((ctx->ctx->current_file_start * 8 + ctx->ctx->bs.offset_bits) >= ctx->block_end_bits) {
+		return_code = dmc_unrar_cancel_check(ctx->ctx->archive);
+		if (return_code != DMC_UNRAR_OK)
+			return return_code;
+
 		if ((return_code = dmc_unrar_rar50_read_block_header(ctx)) != DMC_UNRAR_OK)
 			return return_code;
 
@@ -7944,6 +8038,10 @@ static dmc_unrar_return dmc_unrar_rar50_decompress(dmc_unrar_rar50_context *ctx)
 #if DMC_UNRAR_DISABLE_FILTERS != 1
 	while (ctx->ctx->buffer_offset < ctx->ctx->buffer_size) {
 		const dmc_unrar_size_t current_offset = ctx->ctx->current_file_start + ctx->ctx->solid_offset + ctx->ctx->buffer_offset;
+
+		return_code = dmc_unrar_cancel_check(ctx->ctx->archive);
+		if (return_code != DMC_UNRAR_OK)
+			return return_code;
 
 		if (ctx->filter_overhang > 0) {
 			/* We still have filter output that goes to the decompression output buffer. */
@@ -8069,6 +8167,10 @@ static dmc_unrar_return dmc_unrar_rar50_decompress_block(dmc_unrar_rar50_context
 	(void)stop_at_filter;
 
 	while (*buffer_offset < buffer_size) {
+		return_code = dmc_unrar_cancel_check(ctx->ctx->archive);
+		if (return_code != DMC_UNRAR_OK)
+			return return_code;
+
 		if (ctx->ctx->lzss.error)
 			return DMC_UNRAR_INVALID_DATA;
 
