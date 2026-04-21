@@ -16,17 +16,13 @@ fi
 # We need a tiny extractor binary. Rather than building another C file,
 # reuse example.c which ships with the library and already supports 'e'.
 EX="$REPO/test/example_unrar"
-if [ ! -x "$EX" ]; then
-  cc -std=gnu89 -Wall -Wextra -Wno-long-long -I"$REPO" \
-     "$REPO/example.c" -o "$EX"
-fi
+cc -std=gnu89 -Wall -Wextra -Wno-long-long -I"$REPO" \
+   "$REPO/example.c" -o "$EX"
 
 # Archives we can meaningfully diff.
 # Skipped on purpose:
 #   - encrypted-*.rar / links.rar: the library correctly refuses these.
-#   - solid.rar: RAR5-solid extraction against recent `rar` output is a
-#     known-broken case (hardening.md Phase 4, explicitly deferred).
-ARCHIVES="simple.rar"
+ARCHIVES="simple.rar solid.rar"
 
 fail=0
 

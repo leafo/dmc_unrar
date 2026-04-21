@@ -5465,7 +5465,8 @@ struct dmc_unrar_rar_context_tag {
 
 	bool start_new_file; /** Do we need another solid part? */
 
-	dmc_unrar_size_t current_file_start; /** Offset the current solid part starts at. */
+	dmc_unrar_size_t current_file_start; /** Output offset the current solid part starts at. */
+	dmc_unrar_size_t current_input_start_bits; /** Packed-bit offset the current solid part starts at. */
 
 	dmc_unrar_bs bs;     /** Bitstream input. */
 	dmc_unrar_lzss lzss; /** LZSS context. */
@@ -5530,9 +5531,29 @@ static dmc_unrar_return dmc_unrar_rar_context_init(dmc_unrar_rar_context *ctx,
 
 	ctx->start_new_file     = false;
 	ctx->current_file_start = ctx->output_offset;
+	ctx->current_input_start_bits = 0;
 
 	ctx->buffer_offset = 0;
 	ctx->solid_offset  = 0;
+
+	/* RAR5 block sizes are expressed in packed-bit space, while filters
+	   use current_file_start in unpacked-output space. Keep those bases
+	   separate for solid archives where file chunks have different
+	   compressed and uncompressed sizes. */
+	{
+		dmc_unrar_file_block *part = file->solid_start;
+		while (part && (part != file)) {
+			if (part->file.compressed_size > (uint64_t)(DMC_UNRAR_SIZE_MAX / 8))
+				return DMC_UNRAR_INVALID_DATA;
+			if (ctx->current_input_start_bits > DMC_UNRAR_SIZE_MAX - (dmc_unrar_size_t)part->file.compressed_size * 8)
+				return DMC_UNRAR_INVALID_DATA;
+
+			ctx->current_input_start_bits += (dmc_unrar_size_t)part->file.compressed_size * 8;
+			part = part->solid_next;
+		}
+		if (!part)
+			return DMC_UNRAR_FILE_SOLID_BROKEN;
+	}
 
 	if (!dmc_unrar_io_seek(&archive->io, file->start_pos, DMC_UNRAR_SEEK_SET))
 		return DMC_UNRAR_SEEK_FAIL;
@@ -8023,7 +8044,7 @@ static dmc_unrar_return dmc_unrar_rar50_decompress(dmc_unrar_rar50_context *ctx)
 
 	DMC_UNRAR_ASSERT(ctx);
 
-	while ((ctx->ctx->current_file_start * 8 + ctx->ctx->bs.offset_bits) >= ctx->block_end_bits) {
+	while ((ctx->ctx->current_input_start_bits + ctx->ctx->bs.offset_bits) >= ctx->block_end_bits) {
 		return_code = dmc_unrar_cancel_check(ctx->ctx->archive);
 		if (return_code != DMC_UNRAR_OK)
 			return return_code;
@@ -8198,8 +8219,8 @@ static dmc_unrar_return dmc_unrar_rar50_decompress_block(dmc_unrar_rar50_context
 		if (dmc_unrar_bs_eos(&ctx->ctx->bs) || ctx->ctx->start_new_file)
 			break;
 
-		if ((ctx->ctx->current_file_start * 8 + ctx->ctx->bs.offset_bits) >= ctx->block_end_bits) {
-			while ((ctx->ctx->current_file_start * 8 + ctx->ctx->bs.offset_bits) >= ctx->block_end_bits) {
+		if ((ctx->ctx->current_input_start_bits + ctx->ctx->bs.offset_bits) >= ctx->block_end_bits) {
+			while ((ctx->ctx->current_input_start_bits + ctx->ctx->bs.offset_bits) >= ctx->block_end_bits) {
 				if (ctx->is_last_block) {
 					ctx->ctx->start_new_file = true;
 					break;
@@ -8270,7 +8291,7 @@ static dmc_unrar_return dmc_unrar_rar50_read_block_header(dmc_unrar_rar50_contex
 			return DMC_UNRAR_50_BLOCK_CHECKSUM_NO_MATCH;
 
 		{
-			const dmc_unrar_size_t current_offset = ctx->ctx->current_file_start * 8 + ctx->ctx->bs.offset_bits;
+			const dmc_unrar_size_t current_offset = ctx->ctx->current_input_start_bits + ctx->ctx->bs.offset_bits;
 
 			ctx->block_end_bits = current_offset + block_size * 8 + block_size_bits - 8;
 		}

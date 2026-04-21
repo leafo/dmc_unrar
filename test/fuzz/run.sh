@@ -15,7 +15,7 @@ cd "$HERE"
 
 if [ $# -lt 1 ]; then
   echo "usage: $0 <target> [libfuzzer-args...]" >&2
-  echo "targets: fuzz_open_mem fuzz_filename_stat fuzz_extract_mem" >&2
+  echo "targets: fuzz_open_mem fuzz_filename_stat fuzz_extract_mem fuzz_extract_solid_mem" >&2
   exit 2
 fi
 
@@ -23,7 +23,7 @@ target="$1"
 shift
 
 case "$target" in
-  fuzz_open_mem|fuzz_filename_stat|fuzz_extract_mem) ;;
+  fuzz_open_mem|fuzz_filename_stat|fuzz_extract_mem|fuzz_extract_solid_mem) ;;
   *) echo "$0: unknown target '$target'" >&2; exit 2 ;;
 esac
 

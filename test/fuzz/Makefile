@@ -25,7 +25,7 @@ CFLAGS_FUZZ    = $(CFLAGS_COMMON) \
                  -fno-omit-frame-pointer \
                  -I$(REPO)
 
-TARGETS = fuzz_open_mem fuzz_filename_stat fuzz_extract_mem
+TARGETS = fuzz_open_mem fuzz_filename_stat fuzz_extract_mem fuzz_extract_solid_mem
 
 .PHONY: all seed clean check-clang
 
@@ -46,6 +46,9 @@ fuzz_filename_stat: fuzz_filename_stat.c $(REPO)/dmc_unrar.c
 	$(CC) $(CFLAGS_FUZZ) $< -o $@
 
 fuzz_extract_mem: fuzz_extract_mem.c $(REPO)/dmc_unrar.c
+	$(CC) $(CFLAGS_FUZZ) $< -o $@
+
+fuzz_extract_solid_mem: fuzz_extract_solid_mem.c $(REPO)/dmc_unrar.c
 	$(CC) $(CFLAGS_FUZZ) $< -o $@
 
 # Populate seed/ from existing corpus + fixtures. Hard links so updates

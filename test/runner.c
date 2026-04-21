@@ -189,6 +189,66 @@ static int test_extract_to_heap_ok(void) {
 	return 0;
 }
 
+static int test_solid_rar5_sequential_extract(void) {
+	dmc_unrar_archive a;
+	dmc_unrar_size_t i;
+	static const char *names[] = {
+		"file1.txt",
+		"file2.txt",
+		"file3.txt",
+		"file4.txt",
+		"file5.txt"
+	};
+	static const char *expected[] = {
+		"the quick brown fox jumps over the lazy dog 1\n",
+		"the quick brown fox jumps over the lazy dog 2\n",
+		"the quick brown fox jumps over the lazy dog 3\n",
+		"the quick brown fox jumps over the lazy dog 4\n",
+		"the quick brown fox jumps over the lazy dog 5\n"
+	};
+
+	T_ASSERT_RET(dmc_unrar_archive_init(&a), DMC_UNRAR_OK);
+	T_ASSERT_RET(dmc_unrar_archive_open_path(&a, CORPUS("solid.rar")), DMC_UNRAR_OK);
+
+	for (i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+		dmc_unrar_size_t idx = find_file_by_name(&a, names[i]);
+		dmc_unrar_size_t written = 0;
+		void *out = NULL;
+		T_ASSERT(idx != (dmc_unrar_size_t)-1);
+		T_ASSERT_RET(dmc_unrar_extract_file_to_heap(&a, idx, &out, &written, true),
+		             DMC_UNRAR_OK);
+		T_ASSERT(out != NULL);
+		T_ASSERT_EQ(written, strlen(expected[i]));
+		T_ASSERT(memcmp(out, expected[i], written) == 0);
+		free(out);
+	}
+
+	dmc_unrar_archive_close(&a);
+	return 0;
+}
+
+static int test_solid_rar5_out_of_order_extract(void) {
+	dmc_unrar_archive a;
+	dmc_unrar_size_t idx, written = 0;
+	void *out = NULL;
+	const char *expected = "the quick brown fox jumps over the lazy dog 5\n";
+
+	T_ASSERT_RET(dmc_unrar_archive_init(&a), DMC_UNRAR_OK);
+	T_ASSERT_RET(dmc_unrar_archive_open_path(&a, CORPUS("solid.rar")), DMC_UNRAR_OK);
+	idx = find_file_by_name(&a, "file5.txt");
+	T_ASSERT(idx != (dmc_unrar_size_t)-1);
+
+	T_ASSERT_RET(dmc_unrar_extract_file_to_heap(&a, idx, &out, &written, true),
+	             DMC_UNRAR_OK);
+	T_ASSERT(out != NULL);
+	T_ASSERT_EQ(written, strlen(expected));
+	T_ASSERT(memcmp(out, expected, written) == 0);
+	free(out);
+
+	dmc_unrar_archive_close(&a);
+	return 0;
+}
+
 /* Regression test for B.1: extract_to_heap on a CRC-failing archive must
  * not double-free or leak. Pre-fix: the failure path frees the caller's
  * `void **buffer` handle (an invalid free). ASan catches that. */
@@ -627,6 +687,8 @@ static const test_entry tests[] = {
 	{ "get_filename_and_stat",        test_get_filename_and_stat },
 	{ "extract_to_mem",               test_extract_to_mem },
 	{ "extract_to_heap_ok",           test_extract_to_heap_ok },
+	{ "solid_rar5_sequential_extract", test_solid_rar5_sequential_extract },
+	{ "solid_rar5_out_of_order_extract", test_solid_rar5_out_of_order_extract },
 	{ "extract_to_heap_corrupt_crc",  test_extract_to_heap_corrupt_crc },
 	{ "encrypted_header_detected",    test_encrypted_header_detected },
 	{ "encrypted_data_unsupported",   test_encrypted_data_unsupported },

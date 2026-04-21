@@ -10,6 +10,7 @@ cap_test_total_size
 fuzz/fuzz_open_mem
 fuzz/fuzz_filename_stat
 fuzz/fuzz_extract_mem
+fuzz/fuzz_extract_solid_mem
 fuzz/seed/
 fuzz/work/
 fuzz/crash-*

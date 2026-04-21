@@ -19,6 +19,7 @@ replays under ASan on every PR.
 | `fuzz_open_mem`       | Parser / block walker / header decoders (open + close).          |
 | `fuzz_filename_stat`  | Metadata iteration: `get_file_stat`, `get_filename`, `is_*`.     |
 | `fuzz_extract_mem`    | Decompressors + CRC path: extracts the first supported entry.    |
+| `fuzz_extract_solid_mem` | Solid/state-reuse path: extracts a later entry, then entries sequentially. |
 
 `fuzz_open_mem` is usually the best place to start — it's the fastest
 and finds parser bugs quickly.
@@ -34,6 +35,9 @@ and finds parser bugs quickly.
 
 # Same, but against the extractor (slower, finds different bugs).
 ./run.sh fuzz_extract_mem -max_total_time=600
+
+# Focused solid/state-reuse extraction pass.
+./run.sh fuzz_extract_solid_mem -max_total_time=300
 ```
 
 `run.sh` builds the target if needed, populates `seed/` from the
@@ -94,6 +98,9 @@ without fuzzing.
 - `-rss_limit_mb=2048` if the default 2 GiB limit trips on your box.
 - `-timeout=60` to raise the per-input timeout past the default 25 s
   (useful for `fuzz_extract_mem` on PPMd/solid-looking inputs).
+- `ASAN_OPTIONS=detect_leaks=0 ./run.sh ...` if LeakSanitizer cannot
+  run under your debugger/container setup. Treat real `leak-*` artifacts
+  from environments where LSan works as normal fuzz findings.
 
 ## Known limitations
 
