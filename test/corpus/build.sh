@@ -73,6 +73,36 @@ trap 'rm -rf "$WORK"' EXIT
   (cd solid_mixed && rar a -s -ma5 -msbin -idq "$HERE/solid-mixed.rar" . >/dev/null)
 )
 
+# --- x86filter.rar and solid-filter.rar: archives carrying real ELF
+#     binaries so rar's x86/BCJ filter heuristic fires. Only regenerated
+#     when the host's /usr/bin/true is an x86 ELF -- on arm64 or other
+#     non-x86 hosts these fixtures would cease to exercise the filter
+#     path and silently become false-negatives. The checked-in .rar
+#     files (built on x86_64) stay canonical in that case.
+if file -b /usr/bin/true 2>/dev/null | grep -q 'x86-64\|80386'; then
+  # --- x86filter.rar: single ELF, triggers filter on one entry.
+  (
+    cd "$WORK"
+    mkdir x86f
+    cp /usr/bin/true x86f/true.bin
+    rm -f "$HERE/x86filter.rar"
+    (cd x86f && rar a -ma5 -idq "$HERE/x86filter.rar" . >/dev/null)
+  )
+  # --- solid-filter.rar: solid chain of ELFs; crosses the filter path
+  #     inside a multi-entry solid context.
+  (
+    cd "$WORK"
+    mkdir solid_filt
+    cp /usr/bin/true  solid_filt/1.bin
+    cp /usr/bin/false solid_filt/2.bin
+    cp /usr/bin/yes   solid_filt/3.bin
+    rm -f "$HERE/solid-filter.rar"
+    (cd solid_filt && rar a -s -ma5 -idq "$HERE/solid-filter.rar" . >/dev/null)
+  )
+else
+  echo "corpus/build.sh: host /usr/bin/true is not x86; keeping checked-in x86filter.rar / solid-filter.rar (regen needs an x86 host)" >&2
+fi
+
 # --- encrypted-data.rar: file data encrypted, headers visible ---------------
 (
   cd "$WORK"

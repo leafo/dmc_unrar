@@ -733,6 +733,37 @@ static const struct {
 	{ NULL, NULL }
 };
 
+static int test_size_add_ok_overflow(void) {
+	/* Overflow-check contract for dmc_unrar_size_add_ok: on overflow
+	   returns false and leaves the out pointer untouched; otherwise
+	   returns true with the correct sum. */
+	dmc_unrar_size_t out;
+
+	out = 0;
+	T_ASSERT(dmc_unrar_size_add_ok(0, 0, &out));
+	T_ASSERT_EQ(out, 0);
+
+	out = 0;
+	T_ASSERT(dmc_unrar_size_add_ok(1234, 5678, &out));
+	T_ASSERT_EQ(out, 6912);
+
+	/* Boundary: SIZE_MAX + 0 is exactly representable. */
+	out = 0;
+	T_ASSERT(dmc_unrar_size_add_ok(DMC_UNRAR_SIZE_MAX, 0, &out));
+	T_ASSERT(out == DMC_UNRAR_SIZE_MAX);
+
+	/* Overflow: SIZE_MAX + 1 wraps. Must report failure. */
+	out = 0xdeadbeef;
+	T_ASSERT(!dmc_unrar_size_add_ok(DMC_UNRAR_SIZE_MAX, 1, &out));
+	/* Helper contract: out is undefined on failure, so we don't assert its
+	   value. The point is that the caller sees false and bails. */
+
+	/* Both max: overflows. */
+	T_ASSERT(!dmc_unrar_size_add_ok(DMC_UNRAR_SIZE_MAX, DMC_UNRAR_SIZE_MAX, &out));
+
+	return 0;
+}
+
 static int test_sub_reader_seek_bounds(void) {
 	/* Exercise dmc_unrar_io_sub_seek_func directly with a synthetic parent.
 	   Verifies overflow checks in the signed + unsigned arithmetic and the
@@ -902,6 +933,112 @@ static int test_rar5_corrupt_block_header_crc(void) {
 	return 0;
 }
 
+/* Callback plumbing for the CRC-boundary test. Captures the bytes the
+ * library hands to the callback and runs a streaming CRC32 over them so
+ * the test can compare against the archive's stored CRC. */
+typedef struct {
+	uint8_t         *captured;
+	dmc_unrar_size_t capacity;
+	dmc_unrar_size_t offset;
+	uint32_t         crc;
+} crc_capture;
+
+static bool crc_capture_cb(void *opaque, void **buffer, dmc_unrar_size_t *buffer_size,
+		dmc_unrar_size_t uncompressed_size, dmc_unrar_return *err) {
+	crc_capture *c = (crc_capture *)opaque;
+	(void)buffer_size; (void)err;
+	if (*buffer == NULL || uncompressed_size == 0) return true;
+	if (c->offset + uncompressed_size > c->capacity) {
+		*err = DMC_UNRAR_INVALID_DATA;
+		return false;
+	}
+	memcpy(c->captured + c->offset, *buffer, uncompressed_size);
+	c->crc = dmc_unrar_crc32_continue_from_mem(c->crc, *buffer, uncompressed_size);
+	c->offset += uncompressed_size;
+	return true;
+}
+
+/* End-to-end CRC-boundary contract: the bytes the callback receives are
+ * exactly the bytes CRC accumulates over, INCLUDING post-filter output.
+ *
+ * x86filter.rar is built by archiving a small ELF (`/usr/bin/true`) with
+ * rar -ma5, which triggers rar's x86/BCJ filter heuristic (verified with
+ * an instrumented build). The fixture therefore exercises the filter
+ * path in dmc_unrar_rar5*_decode_block (filter output memcpy'd into the
+ * callback buffer BEFORE CRC accumulation).
+ *
+ * Asserts:
+ *   1. validate_crc=true extraction succeeds (library's own CRC check).
+ *   2. validate_crc=false extraction produces the same byte stream.
+ *   3. Our independent CRC32 over callback bytes matches the archive's
+ *      stored CRC -- proof that what the callback sees == what CRC
+ *      validated. If filter output ever diverged from CRC input, this
+ *      would trip. */
+static int test_crc_covers_filter_output(void) {
+	dmc_unrar_archive a;
+	dmc_unrar_size_t n, i, idx;
+	const dmc_unrar_file *stat;
+	crc_capture cap_true;
+	crc_capture cap_false;
+
+	T_ASSERT_RET(dmc_unrar_archive_init(&a), DMC_UNRAR_OK);
+	T_ASSERT_RET(dmc_unrar_archive_open_path(&a, CORPUS("x86filter.rar")),
+	             DMC_UNRAR_OK);
+
+	n = dmc_unrar_get_file_count(&a);
+	idx = (dmc_unrar_size_t)-1;
+	for (i = 0; i < n; i++) {
+		if (dmc_unrar_file_is_directory(&a, i)) continue;
+		if (dmc_unrar_file_is_supported(&a, i) != DMC_UNRAR_OK) continue;
+		idx = i;
+		break;
+	}
+	T_ASSERT(idx != (dmc_unrar_size_t)-1);
+
+	stat = dmc_unrar_get_file_stat(&a, idx);
+	T_ASSERT(stat != NULL);
+	T_ASSERT(stat->has_crc);
+	T_ASSERT(stat->uncompressed_size > 0);
+	T_ASSERT(stat->uncompressed_size < (uint64_t)(1 << 20));
+
+	cap_true.capacity  = (dmc_unrar_size_t)stat->uncompressed_size;
+	cap_true.captured  = (uint8_t *)malloc(cap_true.capacity);
+	cap_true.offset    = 0;
+	cap_true.crc       = 0;
+	T_ASSERT(cap_true.captured != NULL);
+
+	cap_false.capacity = (dmc_unrar_size_t)stat->uncompressed_size;
+	cap_false.captured = (uint8_t *)malloc(cap_false.capacity);
+	cap_false.offset   = 0;
+	cap_false.crc      = 0;
+	T_ASSERT(cap_false.captured != NULL);
+
+	T_ASSERT_RET(dmc_unrar_extract_file_with_callback(&a, idx, NULL, 4096, NULL,
+	                                                  true, &cap_true, crc_capture_cb),
+	             DMC_UNRAR_OK);
+	T_ASSERT_EQ(cap_true.offset, (dmc_unrar_size_t)stat->uncompressed_size);
+
+	T_ASSERT_RET(dmc_unrar_extract_file_with_callback(&a, idx, NULL, 4096, NULL,
+	                                                  false, &cap_false, crc_capture_cb),
+	             DMC_UNRAR_OK);
+	T_ASSERT_EQ(cap_false.offset, (dmc_unrar_size_t)stat->uncompressed_size);
+
+	/* Invariant 1: both paths see identical bytes. */
+	T_ASSERT_EQ(memcmp(cap_true.captured, cap_false.captured,
+	                   cap_true.offset), 0);
+
+	/* Invariant 2: CRC of what the callback saw == archive's stored CRC.
+	   This is the wharfd-facing promise: validate_crc=true means "bytes
+	   the caller saw are CRC-validated". */
+	T_ASSERT_EQ(cap_true.crc, stat->crc);
+	T_ASSERT_EQ(cap_false.crc, stat->crc);
+
+	free(cap_true.captured);
+	free(cap_false.captured);
+	dmc_unrar_archive_close(&a);
+	return 0;
+}
+
 /* Run the per-fixture work in isolation. Safe to call directly (inline) or
    from a forked child. The expectation is "does not crash or hang" -- the
    return values of the dmc_unrar calls are deliberately ignored. */
@@ -1037,9 +1174,11 @@ static const test_entry tests[] = {
 	{ "filename_is_safe_helper",      test_filename_is_safe_helper },
 	{ "extract_to_path_safe_default", test_extract_to_path_safe_default },
 	{ "extract_to_path_unsafe_variant", test_extract_to_path_unsafe_variant },
+	{ "size_add_ok_overflow",         test_size_add_ok_overflow },
 	{ "sub_reader_seek_bounds",       test_sub_reader_seek_bounds },
 	{ "rar5_vlq_boundary",            test_rar5_vlq_boundary },
 	{ "rar5_corrupt_block_header_crc", test_rar5_corrupt_block_header_crc },
+	{ "crc_covers_filter_output",     test_crc_covers_filter_output },
 	{ "fuzz_regressions",             test_fuzz_regressions },
 };
 

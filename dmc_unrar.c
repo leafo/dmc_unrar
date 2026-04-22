@@ -1656,10 +1656,9 @@ struct dmc_unrar_internal_state_tag {
  * sub-reader seek path -- can call them without forward declarations.
  *
  * Naming: <type>_<op>_ok. Add/mul helpers return false on overflow. The
- * u64 variants write the result through an out-pointer; dmc_unrar_size_mul_ok
- * predates this shape and callers still do the multiply after the check.
- * When a size_t-width add helper is needed, add dmc_unrar_size_add_ok here
- * in the same shape as dmc_unrar_u64_add_ok.
+ * add helpers and the u64 mul helper write the result through an
+ * out-pointer; dmc_unrar_size_mul_ok predates this shape and callers
+ * still do the multiply after the check.
  */
 
 /* Returns true if items*size fits in dmc_unrar_size_t without wrapping. */
@@ -1667,6 +1666,15 @@ static bool dmc_unrar_size_mul_ok(dmc_unrar_size_t items, dmc_unrar_size_t size)
 	if (items == 0 || size == 0)
 		return true;
 	return size <= DMC_UNRAR_SIZE_MAX / items;
+}
+
+/* Compute a + b in size_t, returning false on unsigned overflow. */
+static bool dmc_unrar_size_add_ok(dmc_unrar_size_t a, dmc_unrar_size_t b, dmc_unrar_size_t *out) {
+	dmc_unrar_size_t r = a + b;
+	if (r < a)
+		return false;
+	*out = r;
+	return true;
 }
 
 /* Compute a + b in 64 bits, returning false on unsigned overflow. */
@@ -5603,8 +5611,12 @@ static dmc_unrar_return dmc_unrar_file_extract_with_callback_and_extractor(dmc_u
 
 		*crc = dmc_unrar_crc32_continue_from_mem(*crc, buffer, read_size);
 
-		if (uncompressed_size)
-			*uncompressed_size += read_size;
+		if (uncompressed_size) {
+			if (!dmc_unrar_size_add_ok(*uncompressed_size, read_size, uncompressed_size)) {
+				return_code = DMC_UNRAR_INVALID_DATA;
+				break;
+			}
+		}
 		total_size -= read_size;
 
 		old_buffer = buffer;
@@ -5622,6 +5634,17 @@ static dmc_unrar_return dmc_unrar_file_extract_with_callback_and_extractor(dmc_u
 
 	if (buffer_allocated)
 		dmc_unrar_free(&archive->alloc, buffer);
+
+	/* If we exited the loop before emitting the full declared uncompressed
+	   size and no one asked us to stop (no cancel, no error, the caller's
+	   callback didn't return false), the extractor ran dry mid-file: the
+	   archive data stream is truncated or otherwise inconsistent. Report
+	   it rather than silently returning a partial success. Callers that
+	   intentionally abort early (callback returns false) still get OK
+	   with a short *uncompressed_size, matching the existing _to_mem /
+	   _to_heap contract. */
+	if ((return_code == DMC_UNRAR_OK) && (total_size > 0) && !finished)
+		return_code = DMC_UNRAR_INVALID_DATA;
 
 	return return_code;
 }
@@ -6061,14 +6084,16 @@ static dmc_unrar_return dmc_unrar_rar_context_init(dmc_unrar_rar_context *ctx,
 	return DMC_UNRAR_OK;
 }
 
-static void dmc_unrar_rar_context_continue(dmc_unrar_rar_context *ctx,
+static bool dmc_unrar_rar_context_continue(dmc_unrar_rar_context *ctx,
 		void *buffer, dmc_unrar_size_t buffer_size) {
 
-	ctx->solid_offset += ctx->buffer_offset;
+	if (!dmc_unrar_size_add_ok(ctx->solid_offset, ctx->buffer_offset, &ctx->solid_offset))
+		return false;
 
 	ctx->buffer        = (uint8_t *)buffer;
 	ctx->buffer_size   = buffer_size;
 	ctx->buffer_offset = 0;
+	return true;
 }
 
 static bool dmc_unrar_rar_context_file_match(dmc_unrar_rar_context *ctx,
@@ -6113,7 +6138,10 @@ static dmc_unrar_size_t dmc_unrar_extractor_unpack(void *opaque, void *buffer, d
 
 	dmc_unrar_rar_context *ctx = (dmc_unrar_rar_context *)opaque;
 
-	dmc_unrar_rar_context_continue(ctx, buffer, buffer_size);
+	if (!dmc_unrar_rar_context_continue(ctx, buffer, buffer_size)) {
+		*err = DMC_UNRAR_INVALID_DATA;
+		return 0;
+	}
 
 	*err = ctx->unpack(ctx);
 
