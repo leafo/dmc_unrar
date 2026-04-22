@@ -558,8 +558,14 @@ static int test_filename_is_safe_helper(void) {
 	T_ASSERT(!dmc_unrar_filename_is_safe("\\\\server\\share"));
 	/* Substring "..a" is NOT a traversal */
 	T_ASSERT(dmc_unrar_filename_is_safe("..a"));
-	T_ASSERT(dmc_unrar_filename_is_safe("a.."));
 	T_ASSERT(dmc_unrar_filename_is_safe("a/..b"));
+	/* "a.." is not a traversal, but trailing '.' is rejected when the
+	   Windows-unsafe check is on (default under _WIN32). */
+#if DMC_UNRAR_REJECT_WINDOWS_RESERVED_NAMES
+	T_ASSERT(!dmc_unrar_filename_is_safe("a.."));
+#else
+	T_ASSERT(dmc_unrar_filename_is_safe("a.."));
+#endif
 	return 0;
 }
 
