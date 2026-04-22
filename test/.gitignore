@@ -5,6 +5,8 @@ example_unrar
 cap_test_file_count
 cap_test_file_size
 cap_test_total_size
+cap_test_compression_ratio
+cap_test_dict_size
 phase5_test_utf8
 phase5_test_reserved
 phase5_test_overwrite
@@ -14,6 +16,9 @@ fuzz/fuzz_open_mem
 fuzz/fuzz_filename_stat
 fuzz/fuzz_extract_mem
 fuzz/fuzz_extract_solid_mem
+fuzz/fuzz_open_cb
+fuzz/fuzz_extract_cb
+fuzz/fuzz_cancel
 fuzz/seed/
 fuzz/work/
 fuzz/crash-*

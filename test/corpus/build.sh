@@ -45,6 +45,34 @@ trap 'rm -rf "$WORK"' EXIT
   (cd solid && rar a -s -ma5 -idq "$HERE/solid.rar" . >/dev/null)
 )
 
+# --- solid-long.rar: longer solid chain (8 files) ---------------------------
+# Exercises deeper predecessor traversal than solid.rar (5 files). Picks up
+# bugs that only manifest after N parts of state reuse.
+(
+  cd "$WORK"
+  mkdir solid_long
+  for i in 1 2 3 4 5 6 7 8; do
+    printf 'the quick brown fox jumps over the lazy dog %d\n' "$i" > "solid_long/file${i}.txt"
+  done
+  rm -f "$HERE/solid-long.rar"
+  (cd solid_long && rar a -s -ma5 -idq "$HERE/solid-long.rar" . >/dev/null)
+)
+
+# --- solid-mixed.rar: solid archive mixing stored and compressed entries ----
+# `-msbin` forces files with .bin extension to be stored; the rest are
+# compressed. Crosses both code paths in one chain so a decoder state-leak
+# between stored and compressed entries would corrupt output.
+(
+  cd "$WORK"
+  mkdir solid_mixed
+  for i in 1 2 3 4 5; do
+    printf 'the quick brown fox jumps over the lazy dog %d\n' "$i" > "solid_mixed/file${i}.txt"
+    printf 'binary payload %d: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n' "$i" > "solid_mixed/file${i}.bin"
+  done
+  rm -f "$HERE/solid-mixed.rar"
+  (cd solid_mixed && rar a -s -ma5 -msbin -idq "$HERE/solid-mixed.rar" . >/dev/null)
+)
+
 # --- encrypted-data.rar: file data encrypted, headers visible ---------------
 (
   cd "$WORK"

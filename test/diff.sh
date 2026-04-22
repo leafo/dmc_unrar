@@ -22,7 +22,7 @@ cc -std=gnu89 -Wall -Wextra -Wno-long-long -I"$REPO" \
 # Archives we can meaningfully diff.
 # Skipped on purpose:
 #   - encrypted-*.rar / links.rar: the library correctly refuses these.
-ARCHIVES="simple.rar solid.rar"
+ARCHIVES="simple.rar solid.rar solid-long.rar solid-mixed.rar"
 
 fail=0
 

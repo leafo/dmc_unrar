@@ -247,9 +247,9 @@
 #define DMC_UNRAR_DISABLE_FILTERS 0
 #endif
 
-/* Set DMC_UNRAR_DISABLE_HEADER_CRC_CHECK to 1 to accept RAR4 block headers
- * whose stored CRC does not match. Off by default (i.e. enforcement is on):
- * a bad header CRC causes dmc_unrar_archive_open() to fail with
+/* Set DMC_UNRAR_DISABLE_HEADER_CRC_CHECK to 1 to accept RAR4 and RAR5 block
+ * headers whose stored CRC does not match. Off by default (i.e. enforcement
+ * is on): a bad header CRC causes dmc_unrar_archive_open() to fail with
  * DMC_UNRAR_INVALID_DATA. Historical archives written by broken tools may
  * need this opt-out. */
 #ifndef DMC_UNRAR_DISABLE_HEADER_CRC_CHECK
@@ -1090,6 +1090,14 @@ typedef bool (*dmc_unrar_extract_callback_func)(void *opaque, void **buffer,
  *  Extract into the buffer of buffer_size, calling callback every time the
  *  buffer has been filled (or all the input has been processed).
  *
+ *  CRC coverage (when validate_crc is true): the stored file CRC-32 is
+ *  matched against the bytes that are passed to the callback. Decompression,
+ *  solid-chain drains, and RAR filter transformations (delta, x86, ARM,
+ *  etc.) all run before the CRC update; the callback and the CRC observe
+ *  the same bytes. A CRC mismatch returns DMC_UNRAR_FILE_CRC32_FAIL after
+ *  the callback has already seen every chunk, so callers that persist the
+ *  output eagerly should be prepared to discard it on that return code.
+ *
  *  @param  archive The archive to extract from.
  *  @param  index The index of the file entry to extract.
  *  @param  buffer The pre-allocated memory buffer to extract into. Can be
@@ -1641,7 +1649,18 @@ struct dmc_unrar_internal_state_tag {
 	dmc_unrar_rar_context *unpack_context;
 };
 
-/* .--- Default allocation functions using malloc/realloc/free */
+/* .--- Checked arithmetic helpers
+ *
+ * Overflow-checked primitives used throughout the parser and IO layers.
+ * Kept here (early in the file) so all downstream code -- including the
+ * sub-reader seek path -- can call them without forward declarations.
+ *
+ * Naming: <type>_<op>_ok. Add/mul helpers return false on overflow. The
+ * u64 variants write the result through an out-pointer; dmc_unrar_size_mul_ok
+ * predates this shape and callers still do the multiply after the check.
+ * When a size_t-width add helper is needed, add dmc_unrar_size_add_ok here
+ * in the same shape as dmc_unrar_u64_add_ok.
+ */
 
 /* Returns true if items*size fits in dmc_unrar_size_t without wrapping. */
 static bool dmc_unrar_size_mul_ok(dmc_unrar_size_t items, dmc_unrar_size_t size) {
@@ -1649,6 +1668,26 @@ static bool dmc_unrar_size_mul_ok(dmc_unrar_size_t items, dmc_unrar_size_t size)
 		return true;
 	return size <= DMC_UNRAR_SIZE_MAX / items;
 }
+
+/* Compute a + b in 64 bits, returning false on unsigned overflow. */
+static bool dmc_unrar_u64_add_ok(uint64_t a, uint64_t b, uint64_t *out) {
+	uint64_t r = a + b;
+	if (r < a)
+		return false;
+	*out = r;
+	return true;
+}
+
+/* Compute a * b in 64 bits, returning false on unsigned overflow. */
+static bool dmc_unrar_u64_mul_ok(uint64_t a, uint64_t b, uint64_t *out) {
+	if (a != 0 && b > (uint64_t)(~(uint64_t)0) / a)
+		return false;
+	*out = a * b;
+	return true;
+}
+/* '--- */
+
+/* .--- Default allocation functions using malloc/realloc/free */
 
 static void *dmc_unrar_def_alloc_func(void *opaque, dmc_unrar_size_t items, dmc_unrar_size_t size) {
 	(void)opaque;
@@ -1876,23 +1915,69 @@ static dmc_unrar_size_t dmc_unrar_io_sub_read_func(void *opaque, void *buffer, d
 
 static bool dmc_unrar_io_sub_seek_func(void *opaque, dmc_unrar_offset_t offset, int origin) {
 	dmc_unrar_sub_reader *sub;
+	uint64_t sub_end, parent_pos, back;
+	dmc_unrar_offset_t offset_max;
 
 	if (!opaque || origin < DMC_UNRAR_SEEK_SET || origin > DMC_UNRAR_SEEK_END)
 		return false;
 
 	sub = (dmc_unrar_sub_reader *)opaque;
 
-	if (origin == DMC_UNRAR_SEEK_SET) {
-		offset += sub->start_offset;
-	} else if (origin == DMC_UNRAR_SEEK_END) {
-		offset += sub->start_offset + sub->size;
-		origin = DMC_UNRAR_SEEK_SET;
-	}
+	/* Max positive value representable in the signed offset type. */
+	offset_max = (dmc_unrar_offset_t)(((dmc_unrar_size_t)-1) >> 1);
 
-	if (!dmc_unrar_io_seek(sub->parent, offset, origin))
+	/* start_offset + size must fit in uint64_t. A malformed archive could
+	   place a sub-region at a location that overflows; reject up front so
+	   the rest of the function can treat sub_end as valid. */
+	if (!dmc_unrar_u64_add_ok(sub->start_offset, sub->size, &sub_end))
 		return false;
 
-	sub->offset = dmc_unrar_io_tell(sub->parent) - sub->start_offset;
+	/* Normalize every (offset, origin) to an absolute parent position.
+	   All arithmetic is in uint64_t with overflow checks; the signed
+	   offset is converted to an unsigned magnitude via wrap-around
+	   subtraction so INT*_MIN is handled safely. */
+	if (origin == DMC_UNRAR_SEEK_SET) {
+		if (offset < 0)
+			return false;
+		if (!dmc_unrar_u64_add_ok(sub->start_offset, (uint64_t)offset, &parent_pos))
+			return false;
+	} else if (origin == DMC_UNRAR_SEEK_END) {
+		/* Positive offsets from end point past the sub's end. */
+		if (offset > 0)
+			return false;
+		back = (uint64_t)0 - (uint64_t)offset;
+		if (back > sub->size)
+			return false;
+		parent_pos = sub_end - back;
+	} else { /* DMC_UNRAR_SEEK_CUR */
+		/* Current absolute parent position = start_offset + sub->offset.
+		   Invariant: sub->offset <= sub->size, maintained on every seek. */
+		uint64_t cur_parent;
+		if (!dmc_unrar_u64_add_ok(sub->start_offset, sub->offset, &cur_parent))
+			return false;
+		if (offset < 0) {
+			back = (uint64_t)0 - (uint64_t)offset;
+			if (back > sub->offset)
+				return false;
+			parent_pos = cur_parent - back;
+		} else {
+			if (!dmc_unrar_u64_add_ok(cur_parent, (uint64_t)offset, &parent_pos))
+				return false;
+		}
+	}
+
+	/* The final position must lie within the sub's window. */
+	if (parent_pos < sub->start_offset || parent_pos > sub_end)
+		return false;
+
+	/* Must be representable as a signed offset for the parent call. */
+	if (parent_pos > (uint64_t)offset_max)
+		return false;
+
+	if (!dmc_unrar_io_seek(sub->parent, (dmc_unrar_offset_t)parent_pos, DMC_UNRAR_SEEK_SET))
+		return false;
+
+	sub->offset = parent_pos - sub->start_offset;
 	return true;
 }
 
@@ -1985,11 +2070,15 @@ static void *dmc_unrar_io_win32_open_func(const char *path) {
 
 	/* Calculate the buffer size needed */
 	buf_size = MultiByteToWideChar(CP_UTF8, 0, path, -1, NULL, 0);
-	if (buf_size == 0)
+	if (buf_size <= 0)
+		return NULL;
+
+	/* Reject buf_size * sizeof(wchar_t) overflow before allocating. */
+	if (!dmc_unrar_size_mul_ok((dmc_unrar_size_t)buf_size, sizeof(wchar_t)))
 		return NULL;
 
 	/* Allocate that size in the buffer */
-	buf = DMC_UNRAR_MALLOC(buf_size * sizeof(wchar_t));
+	buf = DMC_UNRAR_MALLOC((dmc_unrar_size_t)buf_size * sizeof(wchar_t));
 	if (buf == NULL)
 		return NULL;
 #endif
@@ -2777,23 +2866,6 @@ static bool dmc_unrar_grow_files(dmc_unrar_archive *archive) {
 
 /* .--- Reading RAR blocks and file headers */
 
-/* Compute a + b in 64 bits, returning false on unsigned overflow. */
-static bool dmc_unrar_u64_add_ok(uint64_t a, uint64_t b, uint64_t *out) {
-	uint64_t r = a + b;
-	if (r < a)
-		return false;
-	*out = r;
-	return true;
-}
-
-/* Compute a * b in 64 bits, returning false on unsigned overflow. */
-static bool dmc_unrar_u64_mul_ok(uint64_t a, uint64_t b, uint64_t *out) {
-	if (a != 0 && b > (uint64_t)(~(uint64_t)0) / a)
-		return false;
-	*out = a * b;
-	return true;
-}
-
 /* Poll the archive's cancel callback. Returns DMC_UNRAR_USER_CANCEL if the
    caller asked us to stop, DMC_UNRAR_OK otherwise (including when no callback
    is registered). Called at the top of long-running library loops. */
@@ -3476,18 +3548,89 @@ static dmc_unrar_return dmc_unrar_rar5_collect_blocks(dmc_unrar_archive *archive
 	return dmc_unrar_connect_solid(archive);
 }
 
+#if DMC_UNRAR_DISABLE_HEADER_CRC_CHECK != 1
+/* Validate a RAR5 block-header CRC. Covers [crc_end_pos, start_pos + header_size):
+   the HeaderSize VLQ field followed by the HeaderSize bytes of header content.
+   The stored CRC is a full 32-bit CRC-32 (not truncated, unlike RAR4).
+
+   Streams the CRC through a fixed-size stack buffer rather than allocating
+   the full header span. A malicious archive can legitimately be large
+   (GiBs), so sizing a buffer against archive->io.size before the resource
+   caps apply is an attacker-controlled allocation. Rejecting end_pos past
+   the archive size also bounds how many bytes we ever read. Restores the
+   caller's stream position on return so the parse resumes where it left
+   off. */
+static dmc_unrar_return dmc_unrar_rar5_validate_header_crc(dmc_unrar_archive *archive,
+		const dmc_unrar_block_header *block, uint64_t crc_end_pos) {
+	uint8_t buf[256];
+	uint64_t end_pos, remaining;
+	dmc_unrar_offset_t saved_pos;
+	uint32_t crc32 = 0;
+
+	if (!dmc_unrar_u64_add_ok(block->start_pos, block->header_size, &end_pos))
+		return DMC_UNRAR_INVALID_DATA;
+	if (end_pos < crc_end_pos)
+		return DMC_UNRAR_INVALID_DATA;
+	/* A header that would extend past the archive stream is malformed by
+	   definition; rejecting here also caps the amount of data the loop
+	   below will read. */
+	if (end_pos > (uint64_t)archive->io.size)
+		return DMC_UNRAR_INVALID_DATA;
+
+	saved_pos = dmc_unrar_io_tell(&archive->io);
+
+	if (!dmc_unrar_io_seek(&archive->io, (dmc_unrar_offset_t)crc_end_pos,
+	                       DMC_UNRAR_SEEK_SET)) {
+		(void)dmc_unrar_io_seek(&archive->io, saved_pos, DMC_UNRAR_SEEK_SET);
+		return DMC_UNRAR_SEEK_FAIL;
+	}
+
+	remaining = end_pos - crc_end_pos;
+	while (remaining > 0) {
+		dmc_unrar_size_t chunk = (remaining > sizeof(buf))
+		                         ? sizeof(buf) : (dmc_unrar_size_t)remaining;
+		if (!dmc_unrar_io_read_checked(&archive->io, buf, chunk)) {
+			(void)dmc_unrar_io_seek(&archive->io, saved_pos, DMC_UNRAR_SEEK_SET);
+			return DMC_UNRAR_READ_FAIL;
+		}
+		crc32 = dmc_unrar_crc32_continue_from_mem(crc32, buf, chunk);
+		remaining -= chunk;
+	}
+
+	if (!dmc_unrar_io_seek(&archive->io, saved_pos, DMC_UNRAR_SEEK_SET))
+		return DMC_UNRAR_SEEK_FAIL;
+
+	return (crc32 == block->crc) ? DMC_UNRAR_OK : DMC_UNRAR_INVALID_DATA;
+}
+#endif /* DMC_UNRAR_DISABLE_HEADER_CRC_CHECK */
+
 /** Read a RAR5 block header. */
 static dmc_unrar_return dmc_unrar_rar5_read_block_header(dmc_unrar_archive *archive,
 	dmc_unrar_block_header *block) {
+
+#if DMC_UNRAR_DISABLE_HEADER_CRC_CHECK != 1
+	uint64_t crc_end_pos;
+#endif
 
 	DMC_UNRAR_ASSERT(archive && block);
 
 	if (!dmc_unrar_io_read_uint32le(&archive->io, &block->crc))
 		return DMC_UNRAR_READ_FAIL;
+#if DMC_UNRAR_DISABLE_HEADER_CRC_CHECK != 1
+	crc_end_pos = (uint64_t)dmc_unrar_io_tell(&archive->io);
+#endif
 	if (!dmc_unrar_rar5_read_number(&archive->io, &block->header_size))
 		return DMC_UNRAR_READ_FAIL;
 
 	block->start_pos = dmc_unrar_io_tell(&archive->io);
+
+#if DMC_UNRAR_DISABLE_HEADER_CRC_CHECK != 1
+	{
+		dmc_unrar_return crc_rc = dmc_unrar_rar5_validate_header_crc(archive, block, crc_end_pos);
+		if (crc_rc != DMC_UNRAR_OK)
+			return crc_rc;
+	}
+#endif
 
 	if (!dmc_unrar_rar5_read_number(&archive->io, &block->type))
 		return DMC_UNRAR_READ_FAIL;
@@ -4833,10 +4976,14 @@ static wchar_t *dmc_unrar_win32_utf8_to_wide(const char *path) {
 	int buf_size = MultiByteToWideChar(CP_UTF8, 0, path, -1, NULL, 0);
 	wchar_t *buf;
 
-	if (buf_size == 0)
+	if (buf_size <= 0)
 		return NULL;
 
-	buf = (wchar_t *)DMC_UNRAR_MALLOC(buf_size * sizeof(wchar_t));
+	/* Reject buf_size * sizeof(wchar_t) overflow before allocating. */
+	if (!dmc_unrar_size_mul_ok((dmc_unrar_size_t)buf_size, sizeof(wchar_t)))
+		return NULL;
+
+	buf = (wchar_t *)DMC_UNRAR_MALLOC((dmc_unrar_size_t)buf_size * sizeof(wchar_t));
 	if (!buf)
 		return NULL;
 

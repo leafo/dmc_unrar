@@ -62,13 +62,18 @@ test-ubsan: runner-ubsan
 runner-ubsan: $(SRC) $(REPO)/dmc_unrar.c
 	$(CC) $(CFLAGS_UBSAN) -I$(REPO) $(SRC) -o $@
 
-# Archive-bomb cap smoke tests. Each binary is cap_test.c compiled with
-# one DMC_UNRAR_MAX_* cap forced low enough to reject simple.rar at open
-# time. Passing means the library returned DMC_UNRAR_INVALID_DATA.
-test-caps: cap_test_file_count cap_test_file_size cap_test_total_size
+# Archive-bomb cap smoke tests. Each binary forces one DMC_UNRAR_MAX_* cap
+# low enough to reject a corpus fixture. Open-time caps build on cap_test.c
+# (rejects at dmc_unrar_archive_open). Extract-time caps build on
+# cap_test_extract.c (opens ok, then rejects during extract). Passing means
+# the library returned DMC_UNRAR_INVALID_DATA from either stage.
+test-caps: cap_test_file_count cap_test_file_size cap_test_total_size \
+           cap_test_compression_ratio cap_test_dict_size
 	cd $(REPO) && $(TESTROOT)/cap_test_file_count
 	cd $(REPO) && $(TESTROOT)/cap_test_file_size
 	cd $(REPO) && $(TESTROOT)/cap_test_total_size
+	cd $(REPO) && $(TESTROOT)/cap_test_compression_ratio
+	cd $(REPO) && $(TESTROOT)/cap_test_dict_size
 
 cap_test_file_count: cap_test.c $(REPO)/dmc_unrar.c
 	$(CC) $(CFLAGS_DEBUG) -I$(REPO) -DDMC_UNRAR_MAX_FILE_COUNT=1 cap_test.c -o $@
@@ -78,6 +83,21 @@ cap_test_file_size: cap_test.c $(REPO)/dmc_unrar.c
 
 cap_test_total_size: cap_test.c $(REPO)/dmc_unrar.c
 	$(CC) $(CFLAGS_DEBUG) -I$(REPO) -DDMC_UNRAR_MAX_TOTAL_SIZE=1 cap_test.c -o $@
+
+# Compression ratio cap fires in the block-collect loop (open time). Use
+# solid.rar, which contains actually-compressed entries (simple.rar can be
+# mostly stored content depending on the fixture generator).
+cap_test_compression_ratio: cap_test.c $(REPO)/dmc_unrar.c
+	$(CC) $(CFLAGS_DEBUG) -I$(REPO) -DDMC_UNRAR_MAX_COMPRESSION_RATIO=1 \
+	  -DCAP_TEST_ARCHIVE='"test/corpus/solid.rar"' cap_test.c -o $@
+
+# LZSS dictionary cap fires at decoder init (extract time).
+cap_test_dict_size: cap_test_extract.c $(REPO)/dmc_unrar.c
+	$(CC) $(CFLAGS_DEBUG) -I$(REPO) -DDMC_UNRAR_MAX_DICT_SIZE=1 cap_test_extract.c -o $@
+
+# NOTE: DMC_UNRAR_MAX_PPMD_SIZE_MB has no cap_test yet. PPMd is a RAR3/RAR4
+# compression method; the current corpus contains no PPMd-compressed archive.
+# Add once a RAR4 PPMd fixture lands under test/corpus/.
 
 # Phase 5 tail opt-in safety defines. Each binary is phase5_test.c compiled
 # with one DMC_UNRAR_* flag forced on plus a PHASE5_MODE_* selector.
@@ -120,4 +140,5 @@ c89:
 clean:
 	rm -f runner runner-asan runner-ubsan \
 	      cap_test_file_count cap_test_file_size cap_test_total_size \
+	      cap_test_compression_ratio cap_test_dict_size \
 	      phase5_test_utf8 phase5_test_reserved phase5_test_overwrite

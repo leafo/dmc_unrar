@@ -1,10 +1,13 @@
 /* Archive-bomb cap smoke test.
  *
- * Compiled three times with different -D overrides that each force
- * one of the DMC_UNRAR_MAX_* caps low enough to reject the golden
- * simple.rar at open time. Passes when dmc_unrar_archive_open_path
- * returns DMC_UNRAR_INVALID_DATA. See test/Makefile for the three
- * -D variants.
+ * Compiled multiple times with different -D overrides that each force
+ * one of the DMC_UNRAR_MAX_* caps low enough to reject a corpus fixture
+ * at open time. Passes when dmc_unrar_archive_open_path returns
+ * DMC_UNRAR_INVALID_DATA. See test/Makefile for the -D variants.
+ *
+ * Compile-time options:
+ *   CAP_TEST_ARCHIVE: path to the fixture, defaults to test/corpus/simple.rar.
+ *     Override when a particular archive is needed to trigger a given cap.
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -16,6 +19,10 @@
 
 #include "../dmc_unrar.c"
 
+#ifndef CAP_TEST_ARCHIVE
+#define CAP_TEST_ARCHIVE "test/corpus/simple.rar"
+#endif
+
 int main(void) {
 	dmc_unrar_archive a;
 	dmc_unrar_return rc;
@@ -25,7 +32,7 @@ int main(void) {
 		return 1;
 	}
 
-	rc = dmc_unrar_archive_open_path(&a, "test/corpus/simple.rar");
+	rc = dmc_unrar_archive_open_path(&a, CAP_TEST_ARCHIVE);
 	dmc_unrar_archive_close(&a);
 
 	if (rc != DMC_UNRAR_INVALID_DATA) {

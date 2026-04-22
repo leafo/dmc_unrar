@@ -21,6 +21,11 @@
 #include <unistd.h>
 #include <errno.h>
 
+#ifndef _WIN32
+#include <sys/wait.h>
+#include <signal.h>
+#endif
+
 #include "../dmc_unrar.c"
 
 /* --- support plumbing ---------------------------------------------------- */
@@ -532,6 +537,55 @@ static int test_cancel_at_solid_skip(void) {
 	return 0;
 }
 
+/* Verifies that cancelling mid-extract on a solid-chain archive leaves the
+ * archive in a state where a subsequent extract on a different entry still
+ * produces the correct bytes. This is the contract wharfd relies on when
+ * wiring dmc_unrar_cancel to a per-request ctx.Done() channel. */
+static int test_cancel_mid_solid_then_extract_other(void) {
+	dmc_unrar_archive a;
+	dmc_unrar_size_t idx5, idx3, written = 0;
+	void *out = NULL;
+	cb_state s;
+	cancel_after_output cancel;
+	const char *expected3 = "the quick brown fox jumps over the lazy dog 3\n";
+	dmc_unrar_return rc;
+
+	s.total = 0;
+	s.saw_nonnull_buffer = false;
+	cancel.state = &s;
+	cancel.calls = 0;
+
+	T_ASSERT_RET(dmc_unrar_archive_init(&a), DMC_UNRAR_OK);
+	T_ASSERT_RET(dmc_unrar_archive_open_path(&a, CORPUS("solid.rar")), DMC_UNRAR_OK);
+
+	idx5 = find_file_by_name(&a, "file5.txt");
+	idx3 = find_file_by_name(&a, "file3.txt");
+	T_ASSERT(idx5 != (dmc_unrar_size_t)-1);
+	T_ASSERT(idx3 != (dmc_unrar_size_t)-1);
+
+	/* Cancel file5 mid-stream after the first output chunk. */
+	a.cancel.func = cancel_after_output_seen;
+	a.cancel.opaque = &cancel;
+	rc = dmc_unrar_extract_file_with_callback(&a, idx5, NULL, 4, NULL,
+	                                          false, &s, cb_collect);
+	T_ASSERT_RET(rc, DMC_UNRAR_USER_CANCEL);
+
+	/* Clear cancel and extract a different, earlier entry. The solid chain
+	   must restart cleanly; any retained decoder state from the cancelled
+	   file5 attempt would corrupt the output here. */
+	a.cancel.func = NULL;
+	a.cancel.opaque = NULL;
+	T_ASSERT_RET(dmc_unrar_extract_file_to_heap(&a, idx3, &out, &written, true),
+	             DMC_UNRAR_OK);
+	T_ASSERT(out != NULL);
+	T_ASSERT_EQ(written, strlen(expected3));
+	T_ASSERT(memcmp(out, expected3, written) == 0);
+	free(out);
+
+	dmc_unrar_archive_close(&a);
+	return 0;
+}
+
 /* Phase D.1: filename_is_safe() helper behavior.
  *
  * These exercise the internal helper directly (it's static; because we
@@ -679,49 +733,278 @@ static const struct {
 	{ NULL, NULL }
 };
 
+static int test_sub_reader_seek_bounds(void) {
+	/* Exercise dmc_unrar_io_sub_seek_func directly with a synthetic parent.
+	   Verifies overflow checks in the signed + unsigned arithmetic and the
+	   "final position lies within the sub window" bound. */
+	uint8_t parent_buf[1024];
+	dmc_unrar_mem_reader mem;
+	dmc_unrar_io parent_io;
+	dmc_unrar_sub_reader sub;
+	dmc_unrar_io sub_io;
+
+	memset(parent_buf, 0, sizeof(parent_buf));
+	mem.buffer = parent_buf;
+	mem.size   = sizeof(parent_buf);
+	mem.offset = 0;
+	T_ASSERT(dmc_unrar_io_init(&parent_io, &dmc_unrar_io_mem_handler, &mem));
+
+	/* Window [100, 300) within a 1 KiB parent. */
+	sub.parent       = &parent_io;
+	sub.start_offset = 100;
+	sub.size         = 200;
+	sub.offset       = 0;
+	T_ASSERT(dmc_unrar_io_init(&sub_io, &dmc_unrar_io_sub_handler, &sub));
+
+	/* Valid SEEK_SET positions. */
+	T_ASSERT(dmc_unrar_io_seek(&sub_io, 0, DMC_UNRAR_SEEK_SET));
+	T_ASSERT_EQ(sub.offset, 0);
+	T_ASSERT(dmc_unrar_io_seek(&sub_io, 200, DMC_UNRAR_SEEK_SET));
+	T_ASSERT_EQ(sub.offset, 200);
+
+	/* Valid SEEK_END (offset <= 0). */
+	T_ASSERT(dmc_unrar_io_seek(&sub_io, 0, DMC_UNRAR_SEEK_END));
+	T_ASSERT_EQ(sub.offset, 200);
+	T_ASSERT(dmc_unrar_io_seek(&sub_io, -50, DMC_UNRAR_SEEK_END));
+	T_ASSERT_EQ(sub.offset, 150);
+
+	/* Valid SEEK_CUR. */
+	T_ASSERT(dmc_unrar_io_seek(&sub_io, -50, DMC_UNRAR_SEEK_CUR));
+	T_ASSERT_EQ(sub.offset, 100);
+	T_ASSERT(dmc_unrar_io_seek(&sub_io, 50, DMC_UNRAR_SEEK_CUR));
+	T_ASSERT_EQ(sub.offset, 150);
+
+	/* Reject negative SEEK_SET. */
+	T_ASSERT(!dmc_unrar_io_seek(&sub_io, -1, DMC_UNRAR_SEEK_SET));
+	/* Reject SEEK_SET past sub end. */
+	T_ASSERT(!dmc_unrar_io_seek(&sub_io, 201, DMC_UNRAR_SEEK_SET));
+	/* Reject positive SEEK_END. */
+	T_ASSERT(!dmc_unrar_io_seek(&sub_io, 1, DMC_UNRAR_SEEK_END));
+	/* Reject SEEK_END past sub start. */
+	T_ASSERT(!dmc_unrar_io_seek(&sub_io, -201, DMC_UNRAR_SEEK_END));
+	/* SEEK_CUR under/overflow against sub window (sub.offset now 150). */
+	T_ASSERT(!dmc_unrar_io_seek(&sub_io, -151, DMC_UNRAR_SEEK_CUR));
+	T_ASSERT(!dmc_unrar_io_seek(&sub_io, 51, DMC_UNRAR_SEEK_CUR));
+
+	/* Pathological: start_offset + size overflows uint64_t. Call the
+	   sub seek directly -- dmc_unrar_io_init would fail here too (it
+	   seeks to SEEK_END), but we want to assert the seek primitive
+	   itself rejects the overflow. */
+	{
+		dmc_unrar_sub_reader big;
+		big.parent       = &parent_io;
+		big.start_offset = (uint64_t)-1 - 50; /* 2^64 - 51 */
+		big.size         = 100;                /* wraps when added */
+		big.offset       = 0;
+		T_ASSERT(!dmc_unrar_io_sub_seek_func(&big, 0, DMC_UNRAR_SEEK_SET));
+		T_ASSERT(!dmc_unrar_io_sub_seek_func(&big, 0, DMC_UNRAR_SEEK_END));
+		T_ASSERT(!dmc_unrar_io_sub_seek_func(&big, 0, DMC_UNRAR_SEEK_CUR));
+	}
+
+	/* Pathological: target parent position exceeds signed offset max. */
+	{
+		dmc_unrar_sub_reader big2;
+		big2.parent       = &parent_io;
+		big2.start_offset = (uint64_t)-1 - 100; /* well past offset_max */
+		big2.size         = 50;                  /* sub_end fits in uint64_t */
+		big2.offset       = 0;
+		T_ASSERT(!dmc_unrar_io_sub_seek_func(&big2, 0, DMC_UNRAR_SEEK_SET));
+	}
+
+	return 0;
+}
+
+static int test_rar5_vlq_boundary(void) {
+	/* Exercise dmc_unrar_rar5_read_number directly at the boundaries of its
+	   10-byte / pos<=70 encoding window. Tests:
+	   - 1-byte varint (no continuation), smallest form.
+	   - Value whose top bits land at shift 63 (max valid shift).
+	   - 10-byte varint with every byte's continuation bit set (max length),
+	     verifies we don't trigger a read of an 11th byte or UB on shift 70.
+	   - Truncated varint: continuation set on the last available byte. */
+
+	dmc_unrar_mem_reader mem;
+	dmc_unrar_io io;
+	uint64_t value;
+
+	/* 1-byte: 0x05 -> 5. */
+	{
+		uint8_t buf[] = { 0x05 };
+		mem.buffer = buf; mem.size = sizeof(buf); mem.offset = 0;
+		T_ASSERT(dmc_unrar_io_init(&io, &dmc_unrar_io_mem_handler, &mem));
+		T_ASSERT(dmc_unrar_rar5_read_number(&io, &value));
+		T_ASSERT_EQ(value, 5);
+	}
+
+	/* Value lands a bit at shift 63. To encode bit 63, byte 10 (index 9,
+	   pos=63) supplies low bit = 1. Bytes 1-9 have value 0 with continuation
+	   set; byte 10 has value 1 without continuation. Result = 1 << 63. */
+	{
+		uint8_t buf[10];
+		int i;
+		for (i = 0; i < 9; i++) buf[i] = 0x80;  /* value=0, continue=1 */
+		buf[9] = 0x01;                           /* value=1, continue=0 */
+		mem.buffer = buf; mem.size = sizeof(buf); mem.offset = 0;
+		T_ASSERT(dmc_unrar_io_init(&io, &dmc_unrar_io_mem_handler, &mem));
+		T_ASSERT(dmc_unrar_rar5_read_number(&io, &value));
+		T_ASSERT(value == ((uint64_t)1 << 63));
+	}
+
+	/* 10-byte varint with continuation set on every byte -- parser should
+	   read exactly 10 bytes (not try an 11th) and succeed. The continuation
+	   bit on byte 10 is ignored (pos would advance to 70 and loop exits). */
+	{
+		uint8_t buf[11];
+		int i;
+		for (i = 0; i < 10; i++) buf[i] = 0xFF;  /* all bits + continuation */
+		buf[10] = 0xDE;  /* guard: if parser reads this, test logic is wrong */
+		mem.buffer = buf; mem.size = sizeof(buf); mem.offset = 0;
+		T_ASSERT(dmc_unrar_io_init(&io, &dmc_unrar_io_mem_handler, &mem));
+		T_ASSERT(dmc_unrar_rar5_read_number(&io, &value));
+		/* Exactly 10 bytes should have been consumed. */
+		T_ASSERT_EQ(mem.offset, 10);
+	}
+
+	/* Truncated: single byte with continuation, no follow-up byte. */
+	{
+		uint8_t buf[] = { 0x80 };  /* value=0, continue=1 */
+		mem.buffer = buf; mem.size = sizeof(buf); mem.offset = 0;
+		T_ASSERT(dmc_unrar_io_init(&io, &dmc_unrar_io_mem_handler, &mem));
+		T_ASSERT(!dmc_unrar_rar5_read_number(&io, &value));
+	}
+
+	return 0;
+}
+
+static int test_rar5_corrupt_block_header_crc(void) {
+	/* A RAR5 archive's first block header CRC lives at bytes 8..11 (right
+	   after the 8-byte signature). Flipping a bit there must cause
+	   dmc_unrar_archive_open_mem to reject the archive with
+	   DMC_UNRAR_INVALID_DATA under the default header-CRC check. */
+	size_t sz;
+	uint8_t *data = (uint8_t *)read_whole_file(CORPUS("simple.rar"), &sz);
+	dmc_unrar_archive a;
+	dmc_unrar_return rc;
+
+	T_ASSERT(data != NULL);
+	T_ASSERT(sz > 16);
+	/* Sanity: RAR5 signature (ends in 0x01 0x00). */
+	T_ASSERT_EQ(data[6], 0x01);
+	T_ASSERT_EQ(data[7], 0x00);
+
+	data[8] ^= 0x01;
+
+	T_ASSERT_RET(dmc_unrar_archive_init(&a), DMC_UNRAR_OK);
+	rc = dmc_unrar_archive_open_mem(&a, data, sz);
+	T_ASSERT_RET(rc, DMC_UNRAR_INVALID_DATA);
+	dmc_unrar_archive_close(&a);
+	free(data);
+	return 0;
+}
+
+/* Run the per-fixture work in isolation. Safe to call directly (inline) or
+   from a forked child. The expectation is "does not crash or hang" -- the
+   return values of the dmc_unrar calls are deliberately ignored. */
+static void run_fuzz_regression_fixture(const char *target, const char *path) {
+	dmc_unrar_archive a;
+
+	if (dmc_unrar_archive_init(&a) != DMC_UNRAR_OK)
+		return;
+	if (dmc_unrar_archive_open_path(&a, path) != DMC_UNRAR_OK) {
+		dmc_unrar_archive_close(&a);
+		return;
+	}
+
+	if (target && strcmp(target, "fuzz_filename_stat") == 0) {
+		dmc_unrar_size_t n = dmc_unrar_get_file_count(&a), j;
+		for (j = 0; j < n; j++) {
+			char buf[1024];
+			(void)dmc_unrar_get_file_stat(&a, j);
+			(void)dmc_unrar_file_is_directory(&a, j);
+			(void)dmc_unrar_file_is_supported(&a, j);
+			(void)dmc_unrar_get_filename(&a, j, buf, sizeof(buf));
+		}
+	} else if (target && strcmp(target, "fuzz_extract_mem") == 0) {
+		dmc_unrar_size_t n = dmc_unrar_get_file_count(&a), j;
+		for (j = 0; j < n; j++) {
+			void *out = NULL;
+			dmc_unrar_size_t out_size = 0;
+			const dmc_unrar_file *stat_;
+			if (dmc_unrar_file_is_directory(&a, j)) continue;
+			if (dmc_unrar_file_is_supported(&a, j) != DMC_UNRAR_OK) continue;
+			stat_ = dmc_unrar_get_file_stat(&a, j);
+			if (!stat_ || stat_->uncompressed_size > (16u * 1024u * 1024u)) continue;
+			(void)dmc_unrar_extract_file_to_heap(&a, j, &out, &out_size, true);
+			free(out);
+			break;
+		}
+	}
+	/* Default: open + close, matching fuzz_open_mem. */
+
+	dmc_unrar_archive_close(&a);
+}
+
+/* Fork a child to run one fixture with an alarm-based timeout. Returns 0 if
+   the child exited cleanly, non-zero on crash, signal, or timeout. Only
+   compiled on POSIX; Windows falls back to inline execution. */
+#ifndef _WIN32
+#define FUZZ_REGRESSION_TIMEOUT_S 30
+
+static int run_fuzz_regression_forked(const char *target, const char *path) {
+	pid_t pid = fork();
+	int status = 0;
+
+	if (pid < 0) {
+		fprintf(stderr, "  fork failed for %s: %s\n", path, strerror(errno));
+		return 1;
+	}
+	if (pid == 0) {
+		/* Child. Disable leak detection in the child: we exit via _exit()
+		   which skips atexit handlers, and we deliberately don't close the
+		   archive on the error paths inside run_fuzz_regression_fixture. */
+		alarm(FUZZ_REGRESSION_TIMEOUT_S);
+		run_fuzz_regression_fixture(target, path);
+		_exit(0);
+	}
+
+	if (waitpid(pid, &status, 0) < 0) {
+		fprintf(stderr, "  waitpid failed for %s: %s\n", path, strerror(errno));
+		return 1;
+	}
+
+	if (WIFSIGNALED(status)) {
+		int sig = WTERMSIG(status);
+		if (sig == SIGALRM)
+			fprintf(stderr, "  TIMEOUT after %ds: %s\n", FUZZ_REGRESSION_TIMEOUT_S, path);
+		else
+			fprintf(stderr, "  killed by signal %d: %s\n", sig, path);
+		return 1;
+	}
+	if (WIFEXITED(status) && WEXITSTATUS(status) != 0) {
+		fprintf(stderr, "  exit %d: %s\n", WEXITSTATUS(status), path);
+		return 1;
+	}
+	return 0;
+}
+#endif
+
 static int test_fuzz_regressions(void) {
 	size_t i;
+	int any_fail = 0;
 	for (i = 0; fuzz_regressions[i].path != NULL; i++) {
 		const char *target = fuzz_regressions[i].target;
 		const char *path   = fuzz_regressions[i].path;
-		dmc_unrar_archive a;
-
-		if (dmc_unrar_archive_init(&a) != DMC_UNRAR_OK)
-			continue;
-		if (dmc_unrar_archive_open_path(&a, path) != DMC_UNRAR_OK) {
-			dmc_unrar_archive_close(&a);
-			continue;
-		}
-
-		if (target && strcmp(target, "fuzz_filename_stat") == 0) {
-			dmc_unrar_size_t n = dmc_unrar_get_file_count(&a), j;
-			for (j = 0; j < n; j++) {
-				char buf[1024];
-				(void)dmc_unrar_get_file_stat(&a, j);
-				(void)dmc_unrar_file_is_directory(&a, j);
-				(void)dmc_unrar_file_is_supported(&a, j);
-				(void)dmc_unrar_get_filename(&a, j, buf, sizeof(buf));
-			}
-		} else if (target && strcmp(target, "fuzz_extract_mem") == 0) {
-			dmc_unrar_size_t n = dmc_unrar_get_file_count(&a), j;
-			for (j = 0; j < n; j++) {
-				void *out = NULL;
-				dmc_unrar_size_t out_size = 0;
-				const dmc_unrar_file *stat_;
-				if (dmc_unrar_file_is_directory(&a, j)) continue;
-				if (dmc_unrar_file_is_supported(&a, j) != DMC_UNRAR_OK) continue;
-				stat_ = dmc_unrar_get_file_stat(&a, j);
-				if (!stat_ || stat_->uncompressed_size > (16u * 1024u * 1024u)) continue;
-				(void)dmc_unrar_extract_file_to_heap(&a, j, &out, &out_size, true);
-				free(out);
-				break;
-			}
-		}
-		/* Default: open + close, matching fuzz_open_mem. */
-
-		dmc_unrar_archive_close(&a);
+#ifdef _WIN32
+		/* No fork on Windows; run inline. A crash-class fixture aborts the
+		   whole runner on this platform -- revisit with CreateProcess +
+		   WaitForSingleObject when needed. */
+		run_fuzz_regression_fixture(target, path);
+#else
+		if (run_fuzz_regression_forked(target, path) != 0)
+			any_fail = 1;
+#endif
 	}
-	return 0;
+	return any_fail;
 }
 
 /* --- test registry ------------------------------------------------------- */
@@ -749,10 +1032,14 @@ static const test_entry tests[] = {
 	{ "cancel_at_open",                test_cancel_at_open },
 	{ "cancel_at_extract",             test_cancel_at_extract },
 	{ "cancel_at_solid_skip",          test_cancel_at_solid_skip },
+	{ "cancel_mid_solid_then_extract_other", test_cancel_mid_solid_then_extract_other },
 	{ "path_extract_no_partial_on_fail", test_path_extract_no_partial_on_fail },
 	{ "filename_is_safe_helper",      test_filename_is_safe_helper },
 	{ "extract_to_path_safe_default", test_extract_to_path_safe_default },
 	{ "extract_to_path_unsafe_variant", test_extract_to_path_unsafe_variant },
+	{ "sub_reader_seek_bounds",       test_sub_reader_seek_bounds },
+	{ "rar5_vlq_boundary",            test_rar5_vlq_boundary },
+	{ "rar5_corrupt_block_header_crc", test_rar5_corrupt_block_header_crc },
 	{ "fuzz_regressions",             test_fuzz_regressions },
 };
 
