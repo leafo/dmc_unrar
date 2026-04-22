@@ -193,8 +193,10 @@ int main(void) {
 		return 1;
 	}
 
+#ifndef _WIN32
 	old_umask = umask(022);
 	restore_umask = true;
+#endif
 
 	/* A stale first-choice temp sibling must not be overwritten. */
 	if (write_text_file(stale_tmp0, "stale-temp") != 0) {
@@ -214,12 +216,14 @@ int main(void) {
 		fail = 1;
 		goto done;
 	}
+#ifndef _WIN32
 	if ((st.st_mode & 0777) != 0644) {
 		fprintf(stderr, "FAIL: extracted mode = %03o, expected %03o\n",
 		        (unsigned)(st.st_mode & 0777), (unsigned)0644);
 		fail = 1;
 		goto done;
 	}
+#endif
 	first_size = st.st_size;
 	if (expect_text_file(stale_tmp0, "stale-temp") != 0) {
 		fail = 1;

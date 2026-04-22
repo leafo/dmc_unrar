@@ -6,7 +6,7 @@ on:
   pull_request:
 
 jobs:
-  tests:
+  linux:
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -32,5 +32,50 @@ jobs:
       - name: UBSan only
         run: make -C test test-ubsan
 
+      - name: Cap smoke tests
+        run: make -C test test-caps
+
+      - name: Phase 5 tail opt-in defines
+        run: make -C test test-phase5-tail
+
       - name: Differential vs system unrar
         run: make -C test diff
+
+  windows:
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-latest
+            msystem: MINGW64
+            install: mingw-w64-x86_64-gcc make
+          - runner: windows-11-arm
+            msystem: CLANGARM64
+            install: mingw-w64-clang-aarch64-clang make
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: ${{ matrix.msystem }}
+          update: false
+          install: ${{ matrix.install }}
+
+      - name: C89 compile check
+        run: make -C test c89
+
+      - name: Plain build + tests
+        run: make -C test test
+
+      - name: ASan + UBSan
+        run: make -C test test-asan
+
+      - name: Cap smoke tests
+        run: make -C test test-caps
+
+      - name: Phase 5 tail opt-in defines
+        run: make -C test test-phase5-tail
