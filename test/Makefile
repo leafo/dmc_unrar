@@ -4,6 +4,7 @@
 #   make -C test test-asan      # address + UB sanitizer
 #   make -C test test-ubsan     # UB sanitizer only
 #   make -C test test-caps      # archive-bomb cap smoke tests
+#   make -C test test-phase5-tail  # Phase 5 tail opt-in safety defines
 #   make -C test diff           # differential extract vs system unrar
 #   make -C test corpus         # regenerate test/corpus/*.rar (needs `rar`)
 #   make -C test c89            # warnings-only compile of dmc_unrar.c
@@ -21,7 +22,7 @@ SRC = runner.c
 TESTROOT = $(CURDIR)
 REPO     = $(CURDIR)/..
 
-.PHONY: all test test-asan test-ubsan test-caps diff corpus fixtures c89 clean
+.PHONY: all test test-asan test-ubsan test-caps test-phase5-tail diff corpus fixtures c89 clean
 
 all: test
 
@@ -65,6 +66,25 @@ cap_test_file_size: cap_test.c $(REPO)/dmc_unrar.c
 cap_test_total_size: cap_test.c $(REPO)/dmc_unrar.c
 	$(CC) $(CFLAGS_DEBUG) -I$(REPO) -DDMC_UNRAR_MAX_TOTAL_SIZE=1 cap_test.c -o $@
 
+# Phase 5 tail opt-in safety defines. Each binary is phase5_test.c compiled
+# with one DMC_UNRAR_* flag forced on plus a PHASE5_MODE_* selector.
+test-phase5-tail: phase5_test_utf8 phase5_test_reserved phase5_test_overwrite
+	cd $(REPO) && $(TESTROOT)/phase5_test_utf8
+	cd $(REPO) && $(TESTROOT)/phase5_test_reserved
+	cd $(REPO) && $(TESTROOT)/phase5_test_overwrite
+
+phase5_test_utf8: phase5_test.c $(REPO)/dmc_unrar.c
+	$(CC) $(CFLAGS_ASAN) -I$(REPO) \
+	  -DDMC_UNRAR_REJECT_NON_UTF8_PATHS=1 -DPHASE5_MODE_UTF8 phase5_test.c -o $@
+
+phase5_test_reserved: phase5_test.c $(REPO)/dmc_unrar.c
+	$(CC) $(CFLAGS_ASAN) -I$(REPO) \
+	  -DDMC_UNRAR_REJECT_WINDOWS_RESERVED_NAMES=1 -DPHASE5_MODE_RESERVED phase5_test.c -o $@
+
+phase5_test_overwrite: phase5_test.c $(REPO)/dmc_unrar.c
+	$(CC) $(CFLAGS_ASAN) -I$(REPO) \
+	  -DDMC_UNRAR_REJECT_OVERWRITE=1 -DPHASE5_MODE_OVERWRITE phase5_test.c -o $@
+
 # Differential extraction vs system unrar.
 diff:
 	cd $(REPO) && $(TESTROOT)/diff.sh
@@ -86,4 +106,5 @@ c89:
 
 clean:
 	rm -f runner runner-asan runner-ubsan \
-	      cap_test_file_count cap_test_file_size cap_test_total_size
+	      cap_test_file_count cap_test_file_size cap_test_total_size \
+	      phase5_test_utf8 phase5_test_reserved phase5_test_overwrite

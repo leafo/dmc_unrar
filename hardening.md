@@ -77,10 +77,21 @@ landed. Completed:
   still outstanding.
 - Phase 5 subset: `dmc_unrar_extract_file_to_path()` now rejects unsafe
   archive filenames (traversal, absolute, UNC, drive prefix) by default
-  and returns `DMC_UNRAR_FILE_UNSAFE_PATH`. Path extraction is also
-  atomic now (temp file + rename), so failed extractions never leave
-  half-written output. The legacy behavior is still available through
-  `dmc_unrar_extract_file_to_path_unsafe()`.
+  and returns `DMC_UNRAR_FILE_UNSAFE_PATH`. Path extraction also writes
+  to an exclusive sibling temp file and publishes only after success, so
+  failed extractions never leave half-written output. The legacy behavior
+  is still available through
+  `dmc_unrar_extract_file_to_path_unsafe()`. Three opt-in compile-time
+  defines extend the safe-path check:
+  `DMC_UNRAR_REJECT_NON_UTF8_PATHS` rejects names that aren't valid UTF-8;
+  `DMC_UNRAR_REJECT_WINDOWS_RESERVED_NAMES` (on when `_WIN32`, off
+  otherwise, overridable) rejects Windows-unsafe components: reserved
+  device names (`CON` / `PRN` / `AUX` / `NUL` / `COM1-9` / `LPT1-9`),
+  illegal characters, ASCII controls, and trailing spaces/dots;
+  `DMC_UNRAR_REJECT_OVERWRITE` makes the safe path refuse to write over
+  an existing target and returns the new `DMC_UNRAR_FILE_EXISTS` code.
+  The first two return `DMC_UNRAR_FILE_UNSAFE_PATH`; all three are
+  covered by `make -C test test-phase5-tail`.
 - Phase 4 subset: RAR5 solid extraction now tracks RAR5 block boundaries
   in packed-bit space rather than reusing the cumulative uncompressed
   output offset as the packed-stream base, with per-file packed offsets
@@ -98,8 +109,6 @@ Still outstanding (tracked below):
   sub-reader seek audit.
 - Phase 4 tail: broader solid coverage, CRC-boundary audit, and early
   callback-cancellation behavior for solid state reuse.
-- Phase 5 tail: UTF-8 enforcement in the safety check, Windows-reserved-
-  name rejection, opt-in overwrite protection.
 - Phase 6 tail: a list-only mode that avoids allocating decompressor
   state. The archive-bomb caps (file count, per-file size, total
   size, compression ratio, PPMd heap) and the cooperative cancel
@@ -267,18 +276,28 @@ Acceptance criteria:
 - [x] Reject `..` path components.
 - [x] Reject Windows drive prefixes.
 - [x] Reject UNC-style paths.
-- [ ] Reject invalid UTF-8 names if the app requires UTF-8. (Library
-      provides `dmc_unrar_unicode_is_valid_utf8()` but the safe-path
-      check does not enforce it yet.)
-- [ ] Reject or sanitize reserved platform names where relevant.
-      (`CON`, `PRN`, `AUX`, `NUL`, `COMx`, `LPTx` on Windows.)
-- [ ] Prevent overwriting existing files unless explicitly allowed.
-      (Current rename step uses `MOVEFILE_REPLACE_EXISTING` / POSIX
-      rename semantics — it will overwrite.)
-- [x] Extract to a temporary file, validate CRC, then rename into place.
-- [x] Never create symlinks, hardlinks, devices, FIFOs, or sockets.
+- [x] Reject invalid UTF-8 names if the app requires UTF-8.
+      (Opt-in via `DMC_UNRAR_REJECT_NON_UTF8_PATHS`; rejection surfaces
+      as `DMC_UNRAR_FILE_UNSAFE_PATH`. Unset by default to preserve
+      compatibility with legacy locale-encoded archives.)
+- [x] Reject or sanitize reserved platform names where relevant.
+      (`DMC_UNRAR_REJECT_WINDOWS_RESERVED_NAMES`, default on under
+      `_WIN32`. Rejects Windows-unsafe components: reserved device names
+      case-insensitively, including extensions (`CON.txt`), illegal
+      characters, ASCII controls, and trailing spaces/dots.)
+- [x] Prevent overwriting existing files unless explicitly allowed.
+      (Opt-in via `DMC_UNRAR_REJECT_OVERWRITE`; pre-flight
+      `lstat()`/`GetFileAttributesW()` before decompressing, plus
+      no-replace final publish. Returns the new
+      `DMC_UNRAR_FILE_EXISTS` error.)
+- [x] Extract to an exclusive temporary file, validate CRC, then publish
+      into place.
+- [x] Never materialize archive symlinks, hardlinks, devices, FIFOs, or
+      sockets.
       (Library refuses link entries via `DMC_UNRAR_FILE_UNSUPPORTED_LINK`
-      and only ever writes through stdio / WIN32 file handles.)
+      and writes regular-file output through exclusive temp handles. POSIX
+      no-replace publish may use `link()` internally, but leaves only the
+      requested regular file at the end.)
 
 Acceptance criteria:
 

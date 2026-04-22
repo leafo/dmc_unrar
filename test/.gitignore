@@ -5,6 +5,9 @@ example_unrar
 cap_test_file_count
 cap_test_file_size
 cap_test_total_size
+phase5_test_utf8
+phase5_test_reserved
+phase5_test_overwrite
 
 # Fuzz harness artifacts
 fuzz/fuzz_open_mem

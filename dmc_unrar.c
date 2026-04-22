@@ -256,6 +256,48 @@
 #define DMC_UNRAR_DISABLE_HEADER_CRC_CHECK 0
 #endif
 
+/* Set DMC_UNRAR_REJECT_NON_UTF8_PATHS to 1 to reject archive filenames that
+ * aren't valid UTF-8 from the safe-by-default path extraction. Off by
+ * default: legitimate archives authored by old tools may carry names in a
+ * locale encoding. Recommended when extracting untrusted archives onto
+ * UTF-8 filesystems (modern Linux, macOS, Windows with UTF-8 paths). A
+ * rejection returns DMC_UNRAR_FILE_UNSAFE_PATH from
+ * dmc_unrar_extract_file_to_path(); the _unsafe variant bypasses the
+ * check. */
+#ifndef DMC_UNRAR_REJECT_NON_UTF8_PATHS
+#define DMC_UNRAR_REJECT_NON_UTF8_PATHS 0
+#endif
+
+/* Set DMC_UNRAR_REJECT_WINDOWS_RESERVED_NAMES to 1 to reject archive
+ * filenames whose components are unsafe on Windows. This includes reserved
+ * device names (CON, PRN, AUX, NUL, COM1-COM9, LPT1-LPT9), illegal
+ * characters (< > : " | ? * and ASCII controls), and components ending in
+ * a space or dot. Device-name stems (bytes before the first '.') are
+ * matched case-insensitively, so CON.txt is rejected alongside bare CON.
+ * Defaults on when _WIN32 is defined, off elsewhere. Override to force on
+ * (e.g. cross-platform builds on Linux producing archives that will also
+ * be extracted on Windows). Rejections return DMC_UNRAR_FILE_UNSAFE_PATH. */
+#ifndef DMC_UNRAR_REJECT_WINDOWS_RESERVED_NAMES
+  #ifdef _WIN32
+    #define DMC_UNRAR_REJECT_WINDOWS_RESERVED_NAMES 1
+  #else
+    #define DMC_UNRAR_REJECT_WINDOWS_RESERVED_NAMES 0
+  #endif
+#endif
+
+/* Set DMC_UNRAR_REJECT_OVERWRITE to 1 to make
+ * dmc_unrar_extract_file_to_path() refuse to write when the target path
+ * already exists. Off by default because upgrade flows rely on replace
+ * semantics. Rejections return the dedicated code DMC_UNRAR_FILE_EXISTS.
+ * Applies to both the safe and _unsafe variants because it concerns the
+ * caller-provided target path, not the archive name. The target is checked
+ * before decompression and published with no-replace filesystem semantics
+ * after decompression; if another process creates it in between, extraction
+ * cleans up its temp file and returns DMC_UNRAR_FILE_EXISTS. */
+#ifndef DMC_UNRAR_REJECT_OVERWRITE
+#define DMC_UNRAR_REJECT_OVERWRITE 0
+#endif
+
 /* Maximum LZSS dictionary (sliding window) size the library will
  * allocate per extraction, in bytes. Malformed archives can claim up to
  * 4 GiB in their RAR5 header; without a cap here the decompressor
@@ -351,8 +393,9 @@
 
 /* --- Basic types --- */
 
-/* We need to set those to get be32toh()/be64toh(). */
-#if defined(__linux__) && (DMC_UNRAR_DISABLE_BE32TOH_BE64TOH != 1)
+/* We need to set those to get be32toh()/be64toh() and POSIX file
+ * helpers used by path extraction. */
+#if defined(__linux__) && ((DMC_UNRAR_DISABLE_BE32TOH_BE64TOH != 1) || (DMC_UNRAR_DISABLE_STDIO != 1))
 #ifndef _BSD_SOURCE
 #define _BSD_SOURCE
 #endif
@@ -500,6 +543,21 @@ typedef DMC_UNRAR_OFFSET_T dmc_unrar_offset_t;
 	#include <windows.h>
 	#if DMC_UNRAR_DISABLE_STDIO != 1
 		#include <io.h>
+		#include <fcntl.h>
+	#endif
+#endif
+
+#if DMC_UNRAR_DISABLE_STDIO != 1 && DMC_UNRAR_DISABLE_WIN32 == 1
+	#if defined(_WIN32)
+		#include <errno.h>
+		#include <fcntl.h>
+		#include <io.h>
+		#include <sys/stat.h>
+	#else
+		#include <errno.h>
+		#include <fcntl.h>
+		#include <sys/stat.h>
+		#include <unistd.h>
 	#endif
 #endif
 
@@ -593,7 +651,9 @@ typedef enum {
 	DMC_UNRAR_50_INVALID_LENGTH_TABLE_DATA,
 	DMC_UNRAR_50_BLOCK_CHECKSUM_NO_MATCH,
 
-	DMC_UNRAR_USER_CANCEL
+	DMC_UNRAR_USER_CANCEL,
+
+	DMC_UNRAR_FILE_EXISTS
 
 } dmc_unrar_return;
 
@@ -1078,8 +1138,23 @@ dmc_unrar_return dmc_unrar_extract_file_to_file(dmc_unrar_archive *archive, dmc_
  *  `C:`, or UNC prefixes like `//server/share`). The error returned is
  *  DMC_UNRAR_FILE_UNSAFE_PATH. This is a safety net for callers that
  *  pass the archive's own filename through to this function unchanged.
- *  Extraction writes to a sibling temp file that is atomically renamed
+ *  Extraction writes to an exclusive sibling temp file that is published
  *  into place on success; on failure nothing is left at `path`.
+ *
+ *  Additional opt-in safety behaviors (all off by default, see defines
+ *  near the top of this file):
+ *    - DMC_UNRAR_REJECT_NON_UTF8_PATHS rejects archive names that aren't
+ *      valid UTF-8 (also returns DMC_UNRAR_FILE_UNSAFE_PATH).
+ *    - DMC_UNRAR_REJECT_WINDOWS_RESERVED_NAMES rejects archive names
+ *      whose components are unsafe on Windows: device names such as
+ *      CON / NUL / COM1, illegal characters, ASCII controls, and
+ *      trailing spaces/dots (default: on when _WIN32, off elsewhere;
+ *      also returns DMC_UNRAR_FILE_UNSAFE_PATH).
+ *    - DMC_UNRAR_REJECT_OVERWRITE makes this function refuse to write
+ *      when `path` already exists, returning DMC_UNRAR_FILE_EXISTS.
+ *      Existing targets found before extraction are rejected without
+ *      decompressing any bytes; targets created during extraction are
+ *      rejected during the final no-replace publish.
  *
  *  @param  archive The archive to extract from.
  *  @param  index The index of the file entry to extract.
@@ -1102,7 +1177,12 @@ dmc_unrar_return dmc_unrar_extract_file_to_path(dmc_unrar_archive *archive, dmc_
  *  yourself, or when the target path is computed independently from
  *  archive contents. For the usual case of feeding
  *  dmc_unrar_get_filename() straight into the target path, prefer the
- *  safe default dmc_unrar_extract_file_to_path().
+ *  safe default dmc_unrar_extract_file_to_path(). The path-safety
+ *  defines (DMC_UNRAR_REJECT_NON_UTF8_PATHS,
+ *  DMC_UNRAR_REJECT_WINDOWS_RESERVED_NAMES) are skipped here, since
+ *  they're all name-safety checks. DMC_UNRAR_REJECT_OVERWRITE still
+ *  applies because it's about the caller-provided target path, not
+ *  the archive name.
  */
 dmc_unrar_return dmc_unrar_extract_file_to_path_unsafe(dmc_unrar_archive *archive,
 	dmc_unrar_size_t index, const char *path,
@@ -1305,6 +1385,9 @@ const char *dmc_unrar_strerror(dmc_unrar_return code) {
 
 		case DMC_UNRAR_FILE_UNSAFE_PATH:
 			return "Archive entry has an unsafe filename (traversal, absolute, or drive/UNC prefix)";
+
+		case DMC_UNRAR_FILE_EXISTS:
+			return "Target file already exists and overwrite protection is enabled";
 
 		case DMC_UNRAR_HUFF_RESERVED_SYMBOL:
 			return "Reserved Huffman symbol";
@@ -4741,47 +4824,6 @@ dmc_unrar_return dmc_unrar_extract_file_to_file(dmc_unrar_archive *archive, dmc_
 
 #if DMC_UNRAR_DISABLE_WIN32 != 1
 
-static FILE *dmc_unrar_win32_fopen_write(const char *path) {
-	FILE *file = NULL;
-
-	/* Assuming we have a UTF-8 path, we need to first convert this to UTF-16 */
-	int buf_size;
-	int result;
-
-#if DMC_UNRAR_DISABLE_MALLOC == 1
-	wchar_t buf[MAX_PATH];
-	buf_size = MAX_PATH;
-#else
-	wchar_t *buf;
-
-	/* Calculate the buffer size needed */
-	buf_size = MultiByteToWideChar(CP_UTF8, 0, path, -1, NULL, 0);
-	if (buf_size == 0)
-		return NULL;
-
-	/* Allocate that size in the buffer */
-	buf = DMC_UNRAR_MALLOC(buf_size * sizeof(wchar_t));
-	if (buf == NULL)
-		return NULL;
-#endif /* DMC_UNRAR_DISABLE_MALLOC */
-
-	/* Actually convert the data now */
-	result = MultiByteToWideChar(CP_UTF8, 0, path, -1, buf, buf_size);
-	if (result == 0)
-		goto end;
-
-	/* Actually open the file */
-	file = _wfopen(buf, L"wb");
-
-end:
-	/* Ensure the buffer is freed if we allocated it */
-#if DMC_UNRAR_DISABLE_MALLOC != 1
-	DMC_UNRAR_FREE(buf);
-#endif /* DMC_UNRAR_DISABLE_MALLOC */
-
-	return file;
-}
-
 /* UTF-8 path -> UTF-16 wchar buffer. Caller frees with DMC_UNRAR_FREE
    (no-op when DMC_UNRAR_DISABLE_MALLOC is set and a static buffer was
    used -- we only use this helper from functions that rely on malloc).
@@ -4805,18 +4847,23 @@ static wchar_t *dmc_unrar_win32_utf8_to_wide(const char *path) {
 	return buf;
 }
 
-static bool dmc_unrar_win32_rename(const char *src, const char *dst) {
+static bool dmc_unrar_win32_rename_with_flags(const char *src, const char *dst, DWORD flags) {
 	wchar_t *wsrc = dmc_unrar_win32_utf8_to_wide(src);
 	wchar_t *wdst = dmc_unrar_win32_utf8_to_wide(dst);
 	bool ok = false;
-	if (wsrc && wdst) {
-		/* Replace an existing target, matching POSIX rename() semantics. */
-		ok = MoveFileExW(wsrc, wdst, MOVEFILE_REPLACE_EXISTING) != 0;
-	}
+	if (wsrc && wdst)
+		ok = MoveFileExW(wsrc, wdst, flags) != 0;
 	DMC_UNRAR_FREE(wsrc);
 	DMC_UNRAR_FREE(wdst);
 	return ok;
 }
+
+#if !DMC_UNRAR_REJECT_OVERWRITE
+static bool dmc_unrar_win32_rename(const char *src, const char *dst) {
+	/* Replace an existing target, matching POSIX rename() semantics. */
+	return dmc_unrar_win32_rename_with_flags(src, dst, MOVEFILE_REPLACE_EXISTING);
+}
+#endif
 
 static void dmc_unrar_win32_unlink(const char *path) {
 	wchar_t *w = dmc_unrar_win32_utf8_to_wide(path);
@@ -4826,16 +4873,126 @@ static void dmc_unrar_win32_unlink(const char *path) {
 }
 #endif /* DMC_UNRAR_DISABLE_MALLOC */
 
+static bool dmc_unrar_win32_error_is_exists(DWORD error) {
+	return (error == ERROR_FILE_EXISTS) || (error == ERROR_ALREADY_EXISTS);
+}
+
+static FILE *dmc_unrar_win32_fopen_write_exclusive(const char *path, bool *already_exists) {
+	FILE *file = NULL;
+	HANDLE handle;
+	int fd;
+
+	if (already_exists)
+		*already_exists = false;
+
+#if DMC_UNRAR_DISABLE_MALLOC == 1
+	wchar_t buf[MAX_PATH];
+	int result;
+
+	result = MultiByteToWideChar(CP_UTF8, 0, path, -1, buf, MAX_PATH);
+	if (result == 0)
+		return NULL;
+#else
+	wchar_t *buf = dmc_unrar_win32_utf8_to_wide(path);
+	if (!buf)
+		return NULL;
+#endif
+
+	handle = CreateFileW(
+		buf,
+		GENERIC_WRITE,
+		0,
+		NULL,
+		CREATE_NEW,
+		FILE_ATTRIBUTE_NORMAL,
+		NULL);
+
+	if (handle == INVALID_HANDLE_VALUE) {
+		if (already_exists && dmc_unrar_win32_error_is_exists(GetLastError()))
+			*already_exists = true;
+		goto end;
+	}
+
+	fd = _open_osfhandle((intptr_t)handle, _O_BINARY);
+	if (fd == -1) {
+		CloseHandle(handle);
+		goto end;
+	}
+
+	file = _fdopen(fd, "wb");
+	if (!file) {
+		_close(fd);
+		DeleteFileW(buf);
+	}
+
+end:
+#if DMC_UNRAR_DISABLE_MALLOC != 1
+	DMC_UNRAR_FREE(buf);
+#endif
+	return file;
+}
+
 #endif /* DMC_UNRAR_DISABLE_WIN32 */
 
-static FILE *dmc_unrar_fopen_write(const char *path) {
+static FILE *dmc_unrar_fopen_write_exclusive(const char *path, bool *already_exists) {
 #if DMC_UNRAR_DISABLE_WIN32 == 1
-	return fopen(path, "wb");
+#if defined(_WIN32)
+	int flags = _O_WRONLY | _O_CREAT | _O_EXCL | _O_BINARY;
+	int fd;
+	FILE *file;
+
+	if (already_exists)
+		*already_exists = false;
+
+	fd = _open(path, flags, _S_IREAD | _S_IWRITE);
+	if (fd < 0) {
+		if (already_exists && errno == EEXIST)
+			*already_exists = true;
+		return NULL;
+	}
+
+	file = _fdopen(fd, "wb");
+	if (!file) {
+		(void)_close(fd);
+		(void)remove(path);
+	}
+	return file;
 #else
-	return dmc_unrar_win32_fopen_write(path);
+	int flags = O_WRONLY | O_CREAT | O_EXCL;
+	int fd;
+	FILE *file;
+
+	if (already_exists)
+		*already_exists = false;
+
+#ifdef O_NOFOLLOW
+	flags |= O_NOFOLLOW;
+#endif
+
+	fd = open(path, flags, 0666);
+	if (fd < 0) {
+		if (already_exists && errno == EEXIST)
+			*already_exists = true;
+#ifdef ELOOP
+		if (already_exists && errno == ELOOP)
+			*already_exists = true;
+#endif
+		return NULL;
+	}
+
+	file = fdopen(fd, "wb");
+	if (!file) {
+		(void)close(fd);
+		(void)remove(path);
+	}
+	return file;
+#endif
+#else
+	return dmc_unrar_win32_fopen_write_exclusive(path, already_exists);
 #endif
 }
 
+#if !DMC_UNRAR_REJECT_OVERWRITE
 static bool dmc_unrar_rename(const char *src, const char *dst) {
 #if DMC_UNRAR_DISABLE_WIN32 == 1
 	return rename(src, dst) == 0;
@@ -4847,8 +5004,48 @@ static bool dmc_unrar_rename(const char *src, const char *dst) {
 	#else
 		return dmc_unrar_win32_rename(src, dst);
 	#endif
+	#endif
+}
+#endif /* !DMC_UNRAR_REJECT_OVERWRITE */
+
+#if DMC_UNRAR_REJECT_OVERWRITE && DMC_UNRAR_DISABLE_WIN32 != 1
+static bool dmc_unrar_rename_no_replace(const char *src, const char *dst) {
+	#if DMC_UNRAR_DISABLE_MALLOC == 1
+		return MoveFileExA(src, dst, 0) != 0;
+	#else
+		return dmc_unrar_win32_rename_with_flags(src, dst, 0);
+	#endif
+}
+#endif /* DMC_UNRAR_REJECT_OVERWRITE && DMC_UNRAR_DISABLE_WIN32 != 1 */
+
+#if DMC_UNRAR_REJECT_OVERWRITE
+/* Return true if `path` names any existing filesystem entry (file, dir,
+   symlink, ...). On the WIN32 path this is a simple attribute probe; on
+   POSIX this uses lstat() so dangling symlinks are rejected before
+   decompression. Final publish is still no-replace, so a concurrent
+   creator after this check is not clobbered. */
+static bool dmc_unrar_file_exists(const char *path) {
+#if DMC_UNRAR_DISABLE_WIN32 == 1
+	struct stat st;
+	#if defined(_WIN32)
+		return stat(path, &st) == 0;
+	#else
+		return lstat(path, &st) == 0;
+	#endif
+#else
+	#if DMC_UNRAR_DISABLE_MALLOC == 1
+		return GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES;
+	#else
+		wchar_t *w = dmc_unrar_win32_utf8_to_wide(path);
+		bool ex = false;
+		if (w)
+			ex = GetFileAttributesW(w) != INVALID_FILE_ATTRIBUTES;
+		DMC_UNRAR_FREE(w);
+		return ex;
+	#endif
 #endif
 }
+#endif /* DMC_UNRAR_REJECT_OVERWRITE */
 
 static void dmc_unrar_unlink(const char *path) {
 #if DMC_UNRAR_DISABLE_WIN32 == 1
@@ -4863,7 +5060,151 @@ static void dmc_unrar_unlink(const char *path) {
 }
 
 /* Suffix appended to the final path while extraction is in progress. */
-#define DMC_UNRAR_EXTRACT_TEMP_SUFFIX ".dmcunrar.tmp"
+#define DMC_UNRAR_EXTRACT_TEMP_SUFFIX ".dmcunrar.tmp."
+#define DMC_UNRAR_EXTRACT_TEMP_HEX_CHARS 8
+#define DMC_UNRAR_EXTRACT_TEMP_ATTEMPTS 256
+
+static void dmc_unrar_make_temp_path(char *temp_path, const char *path,
+		dmc_unrar_size_t path_len, dmc_unrar_size_t attempt) {
+	static const char hex[] = "0123456789abcdef";
+	int i;
+
+	memcpy(temp_path, path, path_len);
+	memcpy(temp_path + path_len, DMC_UNRAR_EXTRACT_TEMP_SUFFIX,
+	       sizeof(DMC_UNRAR_EXTRACT_TEMP_SUFFIX) - 1);
+	temp_path += path_len + sizeof(DMC_UNRAR_EXTRACT_TEMP_SUFFIX) - 1;
+
+	for (i = DMC_UNRAR_EXTRACT_TEMP_HEX_CHARS - 1; i >= 0; i--) {
+		temp_path[i] = hex[attempt & 0x0F];
+		attempt >>= 4;
+	}
+	temp_path[DMC_UNRAR_EXTRACT_TEMP_HEX_CHARS] = '\0';
+}
+
+static FILE *dmc_unrar_open_unique_temp_file(dmc_unrar_archive *archive,
+		const char *path, char **temp_path_out, dmc_unrar_return *error_out) {
+	dmc_unrar_size_t path_len = (dmc_unrar_size_t)strlen(path);
+	dmc_unrar_size_t temp_path_size =
+		path_len + (sizeof(DMC_UNRAR_EXTRACT_TEMP_SUFFIX) - 1) +
+		DMC_UNRAR_EXTRACT_TEMP_HEX_CHARS + 1;
+	dmc_unrar_size_t attempt;
+	char *temp_path;
+	FILE *file = NULL;
+
+	*temp_path_out = NULL;
+	*error_out = DMC_UNRAR_OPEN_FAIL;
+
+	temp_path = (char *)dmc_unrar_malloc(&archive->alloc, temp_path_size, 1);
+	if (!temp_path) {
+		*error_out = DMC_UNRAR_ALLOC_FAIL;
+		return NULL;
+	}
+
+	for (attempt = 0; attempt < DMC_UNRAR_EXTRACT_TEMP_ATTEMPTS; attempt++) {
+		bool already_exists = false;
+		dmc_unrar_make_temp_path(temp_path, path, path_len, attempt);
+		file = dmc_unrar_fopen_write_exclusive(temp_path, &already_exists);
+		if (file) {
+			*temp_path_out = temp_path;
+			return file;
+		}
+		if (!already_exists)
+			break;
+	}
+
+	dmc_unrar_free(&archive->alloc, temp_path);
+	*error_out = DMC_UNRAR_OPEN_FAIL;
+	return NULL;
+}
+
+static dmc_unrar_return dmc_unrar_publish_temp_file(const char *temp_path, const char *path) {
+#if DMC_UNRAR_REJECT_OVERWRITE
+	#if DMC_UNRAR_DISABLE_WIN32 == 1
+		#if defined(_WIN32)
+			if (rename(temp_path, path) == 0)
+				return DMC_UNRAR_OK;
+			if (dmc_unrar_file_exists(path))
+				return DMC_UNRAR_FILE_EXISTS;
+			return DMC_UNRAR_WRITE_FAIL;
+		#else
+			if (link(temp_path, path) == 0) {
+				dmc_unrar_unlink(temp_path);
+				return DMC_UNRAR_OK;
+			}
+			if (errno == EEXIST)
+				return DMC_UNRAR_FILE_EXISTS;
+			return DMC_UNRAR_WRITE_FAIL;
+		#endif
+	#else
+		if (dmc_unrar_rename_no_replace(temp_path, path))
+			return DMC_UNRAR_OK;
+		if (dmc_unrar_file_exists(path))
+			return DMC_UNRAR_FILE_EXISTS;
+		return DMC_UNRAR_WRITE_FAIL;
+	#endif
+#else
+	if (dmc_unrar_rename(temp_path, path))
+		return DMC_UNRAR_OK;
+	return DMC_UNRAR_WRITE_FAIL;
+#endif
+}
+
+#if DMC_UNRAR_REJECT_WINDOWS_RESERVED_NAMES
+/* Return true if the path component [comp, comp+len) matches a Windows
+   reserved device name: CON, PRN, AUX, NUL, COM1-COM9, LPT1-LPT9. Only
+   the stem (bytes before the first '.') participates, case-insensitively.
+   "CON.txt" counts as reserved; ".hidden" and "conflict.txt" do not. */
+static bool dmc_unrar_component_has_windows_reserved_name(const char *comp, dmc_unrar_size_t len) {
+	char stem[4];
+	dmc_unrar_size_t stem_len = 0;
+	unsigned char c;
+
+	while (stem_len < len && comp[stem_len] != '.') {
+		if (stem_len >= sizeof(stem))
+			return false;
+		c = (unsigned char)comp[stem_len];
+		if (c >= 'a' && c <= 'z')
+			c = (unsigned char)(c - 'a' + 'A');
+		stem[stem_len++] = (char)c;
+	}
+
+	if (stem_len == 3) {
+		if (memcmp(stem, "CON", 3) == 0) return true;
+		if (memcmp(stem, "PRN", 3) == 0) return true;
+		if (memcmp(stem, "AUX", 3) == 0) return true;
+		if (memcmp(stem, "NUL", 3) == 0) return true;
+	}
+	if (stem_len == 4 && stem[3] >= '1' && stem[3] <= '9') {
+		if (memcmp(stem, "COM", 3) == 0) return true;
+		if (memcmp(stem, "LPT", 3) == 0) return true;
+	}
+	return false;
+}
+
+/* Return true if the path component is unsafe to materialize on Windows:
+   reserved device name, illegal character, ASCII control byte, or trailing
+   space/dot. */
+static bool dmc_unrar_component_is_windows_unsafe(const char *comp, dmc_unrar_size_t len) {
+	dmc_unrar_size_t i;
+
+	if (len == 0)
+		return false;
+
+	if (comp[len - 1] == ' ' || comp[len - 1] == '.')
+		return true;
+
+	for (i = 0; i < len; i++) {
+		unsigned char c = (unsigned char)comp[i];
+		if (c < 0x20)
+			return true;
+		if (c == '<' || c == '>' || c == ':' || c == '"' ||
+		    c == '|' || c == '?' || c == '*')
+			return true;
+	}
+
+	return dmc_unrar_component_has_windows_reserved_name(comp, len);
+}
+#endif /* DMC_UNRAR_REJECT_WINDOWS_RESERVED_NAMES */
 
 /* Rejects archive filenames that could escape the caller's extraction
    root. Names are assumed normalized to forward-slash separators (which
@@ -4873,6 +5214,11 @@ static bool dmc_unrar_filename_is_safe(const char *name) {
 
 	if (!name || !*name)
 		return false;
+
+#if DMC_UNRAR_REJECT_NON_UTF8_PATHS
+	if (!dmc_unrar_unicode_is_valid_utf8(name))
+		return false;
+#endif
 
 	/* Absolute path. */
 	if (name[0] == '/')
@@ -4909,6 +5255,10 @@ static bool dmc_unrar_filename_is_safe(const char *name) {
 					}
 					first_component = false;
 				}
+#if DMC_UNRAR_REJECT_WINDOWS_RESERVED_NAMES
+				if (dmc_unrar_component_is_windows_unsafe(comp_start, len))
+					return false;
+#endif
 				if (*p == '\0')
 					break;
 				comp_start = p + 1;
@@ -4955,14 +5305,14 @@ static dmc_unrar_return dmc_unrar_extract_file_to_path_impl(dmc_unrar_archive *a
 		dmc_unrar_size_t index, const char *path,
 		dmc_unrar_size_t *uncompressed_size, bool validate_crc, bool check_safety) {
 
-	/* Extract to a sibling temp file and atomically rename on success so
+	/* Extract to an exclusive sibling temp file and publish on success so
 	   a failed or interrupted extraction never leaves a half-written file
 	   that looks successful. */
 
 	dmc_unrar_return return_code;
+	dmc_unrar_return open_temp;
 	FILE *file;
-	dmc_unrar_size_t path_len;
-	char *temp_path;
+	char *temp_path = NULL;
 
 	if (!archive)
 		return DMC_UNRAR_ARCHIVE_IS_NULL;
@@ -4978,28 +5328,27 @@ static dmc_unrar_return dmc_unrar_extract_file_to_path_impl(dmc_unrar_archive *a
 			return safety;
 	}
 
-	path_len = (dmc_unrar_size_t)strlen(path);
-	temp_path = (char *)dmc_unrar_malloc(&archive->alloc,
-		path_len + sizeof(DMC_UNRAR_EXTRACT_TEMP_SUFFIX), 1);
-	if (!temp_path)
-		return DMC_UNRAR_ALLOC_FAIL;
-	memcpy(temp_path, path, path_len);
-	memcpy(temp_path + path_len, DMC_UNRAR_EXTRACT_TEMP_SUFFIX,
-	       sizeof(DMC_UNRAR_EXTRACT_TEMP_SUFFIX));
+#if DMC_UNRAR_REJECT_OVERWRITE
+	/* Pre-flight: reject before decompressing if the target already exists.
+	   The check fires for both the safe and unsafe variants because it
+	   concerns the caller-provided target path, not the archive name.
+	   Final publish is also no-replace, so a concurrent creator after
+	   this check gets DMC_UNRAR_FILE_EXISTS without being clobbered. */
+	if (dmc_unrar_file_exists(path))
+		return DMC_UNRAR_FILE_EXISTS;
+#endif
 
-	file = dmc_unrar_fopen_write(temp_path);
-	if (!file) {
-		dmc_unrar_free(&archive->alloc, temp_path);
-		return DMC_UNRAR_OPEN_FAIL;
-	}
+	file = dmc_unrar_open_unique_temp_file(archive, path, &temp_path, &open_temp);
+	if (!file)
+		return open_temp;
 
 	return_code = dmc_unrar_extract_file_to_file(archive, index, file, uncompressed_size, validate_crc);
 	fclose(file);
 
 	if (return_code == DMC_UNRAR_OK) {
-		if (!dmc_unrar_rename(temp_path, path)) {
+		return_code = dmc_unrar_publish_temp_file(temp_path, path);
+		if (return_code != DMC_UNRAR_OK) {
 			dmc_unrar_unlink(temp_path);
-			return_code = DMC_UNRAR_WRITE_FAIL;
 			if (uncompressed_size)
 				*uncompressed_size = 0;
 		}
