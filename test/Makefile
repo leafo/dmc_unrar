@@ -13,8 +13,21 @@
 CC      ?= gcc
 CFLAGS_COMMON  = -std=gnu89 -Wall -Wextra -Wno-long-long -g -O1
 CFLAGS_DEBUG   = $(CFLAGS_COMMON) -D_FORTIFY_SOURCE=0
-CFLAGS_ASAN    = $(CFLAGS_COMMON) -fsanitize=address,undefined -fno-omit-frame-pointer
-CFLAGS_UBSAN   = $(CFLAGS_COMMON) -fsanitize=undefined -fno-omit-frame-pointer
+
+# MinGW-w64 GCC and MSYS2 CLANGARM64 don't ship the ASan/UBSan runtime
+# libraries, so -fsanitize=... fails at link time. Drop the flags on
+# Windows; the sanitizer targets still build and run, just without
+# sanitizer coverage. Sanitizer coverage remains on the Linux jobs.
+ifeq ($(OS),Windows_NT)
+  SANITIZE_ASAN  =
+  SANITIZE_UBSAN =
+else
+  SANITIZE_ASAN  = -fsanitize=address,undefined -fno-omit-frame-pointer
+  SANITIZE_UBSAN = -fsanitize=undefined -fno-omit-frame-pointer
+endif
+
+CFLAGS_ASAN    = $(CFLAGS_COMMON) $(SANITIZE_ASAN)
+CFLAGS_UBSAN   = $(CFLAGS_COMMON) $(SANITIZE_UBSAN)
 
 # Tests #include "../dmc_unrar.c" directly, so we only compile runner.c.
 SRC = runner.c

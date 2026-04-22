@@ -71,8 +71,9 @@ jobs:
       - name: Plain build + tests
         run: make -C test test
 
-      - name: ASan + UBSan
-        run: make -C test test-asan
+      # No ASan/UBSan on Windows: neither MinGW-w64 GCC nor MSYS2
+      # CLANGARM64 ship the sanitizer runtime libraries. Linux jobs
+      # cover sanitizer runs.
 
       - name: Cap smoke tests
         run: make -C test test-caps
