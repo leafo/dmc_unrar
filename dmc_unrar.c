@@ -343,6 +343,24 @@
 #define DMC_UNRAR_MAX_PPMD_SIZE_MB (32u)
 #endif
 
+/* Maximum RAR5 entry-name length enforced during header parsing. Names
+ * longer than this cap cause the archive open to fail with
+ * DMC_UNRAR_INVALID_DATA. 64 KiB is well above every legitimate path
+ * limit; lower it for workloads that only see short names. */
+#ifndef DMC_UNRAR_RAR5_NAME_MAX_LENGTH
+#define DMC_UNRAR_RAR5_NAME_MAX_LENGTH 65536
+#endif
+
+/* Stack buffer size used by the RAR4 filename parser during
+ * dmc_unrar_get_filename(). Also bounds the ASCII/UTF-16 working
+ * buffers used for RAR4 unicode-name decoding. Names longer than this
+ * cap return 0 from dmc_unrar_get_filename(). 512 matches the classic
+ * RAR4 filename limit; raise if you see truncated legacy names, lower
+ * to shrink the parser's stack footprint. */
+#ifndef DMC_UNRAR_FILENAME_MAX_LENGTH
+#define DMC_UNRAR_FILENAME_MAX_LENGTH 512
+#endif
+
 /* Do we have large file (>= 2GB) support? Can be defined to force enabling
  * or disabling of large file support, or kept undefined to let the
  * autodetection figure it out. The autodetection errs on being conservative,
@@ -3445,12 +3463,11 @@ static dmc_unrar_return dmc_unrar_rar4_read_file_header(dmc_unrar_archive *archi
 	return DMC_UNRAR_OK;
 }
 
-/* Upper bound on the advertised filename length for a RAR5 file entry.
+/* DMC_UNRAR_RAR5_NAME_MAX_LENGTH bounds the RAR5 file-entry name_size.
    The RAR5 format lets this field span a 64-bit varint, which lets a
    malformed archive claim name_size == 0xFFFFFFFFFFFFFFFF and wrap the
-   extra-field walker's pos arithmetic. Sixty-four kilobytes is comfortably
-   above any real path length and still cheap to validate. */
-#define DMC_UNRAR_RAR5_NAME_MAX_LENGTH 65536
+   extra-field walker's pos arithmetic. The default (64 KiB) is overridable
+   from the config block at the top of this file. */
 
 /** Read a variable-length RAR5 number. */
 static bool dmc_unrar_rar5_read_number(dmc_unrar_io *io, uint64_t *number) {
@@ -4263,7 +4280,10 @@ const dmc_unrar_file *dmc_unrar_get_file_stat(dmc_unrar_archive *archive, dmc_un
 	return &file->file;
 }
 
-#define DMC_UNRAR_FILENAME_MAX_LENGTH 512
+/* DMC_UNRAR_FILENAME_MAX_LENGTH bounds the RAR4 filename parser's stack
+   buffers and rejects entries whose declared name_size exceeds it.
+   Default 512 matches the RAR4 filename limit; override from the config
+   block at the top of this file. */
 
 static bool dmc_unrar_get_filename_utf16(const uint8_t *data, dmc_unrar_size_t data_size,
 		uint16_t *name_utf16, dmc_unrar_size_t *name_utf16_length) {
@@ -4436,6 +4456,12 @@ dmc_unrar_size_t dmc_unrar_get_filename(dmc_unrar_archive *archive, dmc_unrar_si
 	if (!filename)
 		return dmc_unrar_get_filename_length(archive, index);
 
+	/* filename!=NULL with filename_size==0 would underflow filename_size-1
+	   below. The ASCII branch guards this explicitly; mirror that guard
+	   up-front so the Unicode branch is safe too. */
+	if (filename_size == 0)
+		return 0;
+
 	if (!dmc_unrar_io_seek(&archive->io, file->name_offset, DMC_UNRAR_SEEK_SET))
 		return 0;
 
@@ -4547,7 +4573,7 @@ static bool dmc_unrar_20_read_comment_file(dmc_unrar_archive *archive, dmc_unrar
 
 	if (block->flags & DMC_UNRAR_FLAG4_ARCHIVE_ENCRYPTVERSION)
 		if (!dmc_unrar_io_seek(&archive->io, 1, DMC_UNRAR_SEEK_CUR))
-			return DMC_UNRAR_SEEK_FAIL;
+			return false;
 
 	return dmc_unrar_20_read_comment_file_at_position(archive, file);
 }

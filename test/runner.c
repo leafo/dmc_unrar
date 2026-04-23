@@ -160,6 +160,25 @@ static int test_get_filename_and_stat(void) {
 	return 0;
 }
 
+/* Guard for the filename!=NULL, filename_size==0 case: the Unicode RAR4
+   branch previously underflowed filename_size-1 and wrote past the
+   caller's zero-byte buffer. The ASCII branch already handled this; the
+   test pins both branches to the same "return 0, don't touch the
+   buffer" shape regardless of archive generation. */
+static int test_get_filename_zero_size_buffer(void) {
+	dmc_unrar_archive a;
+	dmc_unrar_size_t idx;
+	char canary = 0x7f;
+	T_ASSERT_RET(dmc_unrar_archive_init(&a), DMC_UNRAR_OK);
+	T_ASSERT_RET(dmc_unrar_archive_open_path(&a, CORPUS("simple.rar")), DMC_UNRAR_OK);
+	idx = find_file_by_name(&a, "hello.txt");
+	T_ASSERT(idx != (dmc_unrar_size_t)-1);
+	T_ASSERT_EQ(dmc_unrar_get_filename(&a, idx, &canary, 0), 0);
+	T_ASSERT_EQ((int)(unsigned char)canary, 0x7f);
+	dmc_unrar_archive_close(&a);
+	return 0;
+}
+
 static int test_extract_to_mem(void) {
 	dmc_unrar_archive a;
 	dmc_unrar_size_t idx, written = 0;
@@ -1155,6 +1174,7 @@ static const test_entry tests[] = {
 	{ "open_file_simple",             test_open_file_simple },
 	{ "is_rar",                       test_is_rar },
 	{ "get_filename_and_stat",        test_get_filename_and_stat },
+	{ "get_filename_zero_size_buffer", test_get_filename_zero_size_buffer },
 	{ "extract_to_mem",               test_extract_to_mem },
 	{ "extract_to_heap_ok",           test_extract_to_heap_ok },
 	{ "solid_rar5_sequential_extract", test_solid_rar5_sequential_extract },

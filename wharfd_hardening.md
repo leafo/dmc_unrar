@@ -128,6 +128,8 @@ All fire deterministically with `DMC_UNRAR_INVALID_DATA`:
 | `DMC_UNRAR_MAX_COMPRESSION_RATIO` | 1000:1 | Per-entry ratio; stored entries always pass |
 | `DMC_UNRAR_MAX_DICT_SIZE` | 256 MiB | LZSS sliding window |
 | `DMC_UNRAR_MAX_PPMD_SIZE_MB` | 32 MiB | Archive-declared PPMd heap |
+| `DMC_UNRAR_RAR5_NAME_MAX_LENGTH` | 64 KiB | RAR5 entry name_size cap |
+| `DMC_UNRAR_FILENAME_MAX_LENGTH` | 512 | RAR4 filename-parser stack buffer |
 
 Count/size/total/ratio caps fire inside the RAR4 and RAR5
 block-collect loops after a real file header is parsed (metadata
@@ -151,6 +153,17 @@ the per-block heap hint. Ratio uses overflow-checked multiplication.
   bytes before `uncompressed_size` is reached trips `INVALID_DATA`
   rather than silently reporting success. Protects wharfd against
   archives that advertise a size they can't deliver.
+- `dmc_unrar_get_filename()` rejects `filename != NULL, filename_size
+  == 0` up-front. Both the ASCII and Unicode RAR4 branches previously
+  diverged on this: the Unicode branch underflowed `filename_size - 1`
+  and could write past a zero-byte caller buffer. Wharfd never hits
+  this in the probe-and-fill flow, but a mis-sized Go slice would
+  previously corrupt memory instead of returning 0.
+- Bool-return-enum bug fixed in the rar20 archive-comment seek path
+  (`dmc_unrar_20_read_comment_file`): returning `DMC_UNRAR_SEEK_FAIL`
+  from a `bool` function inverted the error signal, reporting success
+  on seek failure. Only reachable on RAR4 archives with the encrypt-
+  version flag set, but silent enough to matter.
 
 ### Fuzzing infrastructure
 - Seven libFuzzer harnesses: `fuzz_open_mem` (parser / block walker),
@@ -296,6 +309,12 @@ mid-extract cancel) won't be surfaced by the current harnesses.
 - RAR4 corpus fixture and RAR4 diff-test. `rar` 7.x can't emit RAR4,
   so this requires a checked-in archive from an older tool. Wharfd
   sees RAR4 in the upload firehose.
+- `DMC_UNRAR_DISABLE_RAR4` compile switch for attack-surface reduction
+  on workloads that never see RAR4 (not wharfd — wharfd sees RAR4 —
+  but useful for other vendorers). Would ifdef out rar15/20/30
+  decompressors, the RAR4 block-collect loop, and reject RAR4-
+  generation archives at open. Larger change; tracked here so it
+  doesn't get lost.
 
 ### Static-analyzer pass (scan-build / clang-analyzer)
 
