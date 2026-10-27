@@ -1163,6 +1163,48 @@ static int test_fuzz_regressions(void) {
 	return any_fail;
 }
 
+static int check_archive_comment(const char *path) {
+	dmc_unrar_archive a;
+	dmc_unrar_size_t size, got;
+	char raw[1024], utf8[1024];
+	const char *text = raw;
+	T_ASSERT_RET(dmc_unrar_archive_init(&a), DMC_UNRAR_OK);
+	T_ASSERT_RET(dmc_unrar_archive_open_path(&a, path), DMC_UNRAR_OK);
+	size = dmc_unrar_get_archive_comment(&a, NULL, 0);
+	T_ASSERT(size > 0 && size < sizeof(raw));
+	got = dmc_unrar_get_archive_comment(&a, raw, sizeof(raw));
+	T_ASSERT_EQ(got, size);
+	raw[got] = 0;
+	if (dmc_unrar_unicode_detect_encoding(raw, got) == DMC_UNRAR_UNICODE_ENCODING_UTF16LE) {
+		T_ASSERT(dmc_unrar_unicode_convert_utf16le_to_utf8(raw, got, utf8, sizeof(utf8)) > 0);
+		text = utf8;
+	}
+	T_ASSERT(strstr(text, "Setup=activator.exe") != NULL);
+	T_ASSERT(strstr(text, "Overwrite=1") != NULL);
+	dmc_unrar_archive_close(&a);
+	return 0;
+}
+
+static int test_archive_comment_rar5(void) {
+	return check_archive_comment(CORPUS("comment.rar"));
+}
+
+/* The RAR4 comment is compressed and lives outside the file table, so it
+   never joins a solid chain; extracting it must not be treated as a broken
+   solid block. */
+static int test_archive_comment_rar4_compressed(void) {
+	return check_archive_comment(FIXTURE("comment-rar4.rar"));
+}
+
+static int test_archive_comment_absent(void) {
+	dmc_unrar_archive a;
+	T_ASSERT_RET(dmc_unrar_archive_init(&a), DMC_UNRAR_OK);
+	T_ASSERT_RET(dmc_unrar_archive_open_path(&a, CORPUS("simple.rar")), DMC_UNRAR_OK);
+	T_ASSERT_EQ(dmc_unrar_get_archive_comment(&a, NULL, 0), 0);
+	dmc_unrar_archive_close(&a);
+	return 0;
+}
+
 /* --- test registry ------------------------------------------------------- */
 
 typedef int (*test_fn)(void);
@@ -1200,6 +1242,9 @@ static const test_entry tests[] = {
 	{ "rar5_corrupt_block_header_crc", test_rar5_corrupt_block_header_crc },
 	{ "crc_covers_filter_output",     test_crc_covers_filter_output },
 	{ "fuzz_regressions",             test_fuzz_regressions },
+	{ "archive_comment_rar5",         test_archive_comment_rar5 },
+	{ "archive_comment_rar4_compressed", test_archive_comment_rar4_compressed },
+	{ "archive_comment_absent",       test_archive_comment_absent },
 };
 
 int main(int argc, char **argv) {

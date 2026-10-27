@@ -6097,8 +6097,13 @@ static dmc_unrar_return dmc_unrar_rar_context_init(dmc_unrar_rar_context *ctx,
 	   use current_file_start in unpacked-output space. Keep those bases
 	   separate for solid archives where file chunks have different
 	   compressed and uncompressed sizes. */
-	if (!file->solid_start)
-		return DMC_UNRAR_FILE_SOLID_BROKEN;
+	/* Archive comments are read outside the file table, so they were
+	   never linked into a solid chain; a non-solid file is its own start. */
+	if (!file->solid_start) {
+		if (file->is_solid)
+			return DMC_UNRAR_FILE_SOLID_BROKEN;
+		file->solid_start = file;
+	}
 	ctx->current_input_start_bits = file->solid_input_start_bits;
 
 	if (!dmc_unrar_io_seek(&archive->io, file->start_pos, DMC_UNRAR_SEEK_SET))

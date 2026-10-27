@@ -37,4 +37,9 @@ with open(dst, 'wb') as f:
     f.write(bytes(data))
 PY
 
+# comment-rar4.rar is not generated: rar 7.x cannot write RAR4 archives.
+# It is the marker, main header and compressed CMT sub-block carved from a
+# WinRAR 4 SFX, with the file entries dropped. The comment holds the same
+# SFX script as corpus/comment.rar.
+
 echo "fixtures rebuilt in $HERE"

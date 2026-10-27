@@ -131,4 +131,14 @@ fi
   (cd links && rar a -ol -ma5 -idq "$HERE/links.rar" . >/dev/null)
 )
 
+# --- comment.rar: archive comment holding an SFX setup script ---------------
+(
+  cd "$WORK"
+  mkdir comment
+  printf 'hello world\n' > comment/text.txt
+  printf ';The comment below contains SFX script commands\n\nPath=%%temp%%\nSetup=activator.exe\nSetup="Southern Comforts.exe"\nTempMode\nSilent=1\nOverwrite=1\n' > script.txt
+  rm -f "$HERE/comment.rar"
+  (cd comment && rar a -ma5 -z../script.txt -idq "$HERE/comment.rar" . >/dev/null)
+)
+
 echo "corpus regenerated in $HERE"
